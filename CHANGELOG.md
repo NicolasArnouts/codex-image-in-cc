@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (review round 3)
+
+- Ctrl-C, SIGTERM and SIGHUP to the wrapper now stop Codex too (it runs detached in its own process group, so it used to keep running and spending quota): every codex group gets SIGTERM, then SIGKILL after at most 3 s; unfilled placeholders, temp files and directories the run created are removed; exit codes 130 / 143 / 129.
+- Direct mode reserves the final file name only when the image is copied, so no 0-byte file sits in the out dir during the turn (skill mode still reserves up front, since Codex writes the file).
+- A failure while finalizing (EACCES, ENOSPC ...) no longer leaves 0-byte placeholders; one unsaveable image of several is reported as a warning. The temp-file name is short, so a long `--out` basename no longer hits ENAMETOOLONG.
+- The source format is detected by magic bytes and converted with `sips` whenever it differs from the `--out` extension (jpg/webp data to `.png`, png to `.jpg`); without sips that image fails with a clear error instead of being copied byte-for-byte or silently kept as png.
+- `--force` only applies to an explicit file target; directory targets are always versioned.
+- A leading `~/` (or bare `~`) in `--out`, `--ref`, the edit input and manifest paths means the home directory.
+- Without a thread id an image is only taken from a thread dir created after the spawn whose session rollout was also created after the spawn (no 2 s look-back); otherwise the item fails and says where the image was left.
+- An unterminated quote in a flag value or edit input is an error instead of a literal `"name` folder.
+
 ## [0.4.0-nico.1] - 2026-11-25
 
 Fork of [KingGyuSuh/codex-image-in-cc](https://github.com/KingGyuSuh/codex-image-in-cc). Measured on codex-cli 0.172.0 with a ChatGPT login.

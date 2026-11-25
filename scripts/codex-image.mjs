@@ -2030,7 +2030,7 @@ function usage() {
     "  --mode direct|skill default direct (env CODEX_IMAGE_MODE)",
     "  --effort <e>        low|medium|high|xhigh|max|ultra (env CODEX_IMAGE_EFFORT)",
     "  --model <slug>      default: account default (env CODEX_IMAGE_MODEL)",
-    "  --force             overwrite an existing --out file (default: -v2, -v3 ... sibling)",
+    "  --force             overwrite an existing --out file (file targets only; default: -v2, -v3 ... sibling)",
     "",
     "Stdout: SAVED: <path>, INFO: <path> <W>x<H> alpha=<yes|no> source=<path>, USAGE: ...",
     "",

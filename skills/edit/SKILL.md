@@ -8,7 +8,7 @@ allowed-tools: Bash(node:*)
 
 Flags come first, then the input image path (the first token after the flags), then the edit prompt. Quote the path if it contains spaces (e.g. `"my photo.png" make it red`).
 
-- `--out <path>`: a file (`.png`, `.jpg`, `.jpeg`; other extensions are rejected) or a directory. Prefer an absolute path. Default: `./codex-images/<UTC-timestamp>-edit-<n>.png`. An existing file is never overwritten (a `-v2` sibling is used) unless `--force`.
+- `--out <path>`: a file (`.png`, `.jpg`, `.jpeg`; other extensions are rejected) or a directory. Prefer an absolute path. Default: `./codex-images/<UTC-timestamp>-edit-<n>.png`. An existing file is never overwritten (a `-v2` sibling is used) unless `--force` (file targets only). A leading `~/` means the home directory.
 - `--size <W>x<H>`, `--transparent`, `--mode direct|skill`, `--effort <e>`, `--model <slug>`: as for generate.
 
 This command runs a Codex agent turn and typically takes 30-90 seconds. Run it with a 10-minute Bash timeout (600000 ms). For more than about 3 edits use `/codex-image:batch` (manifest items with an `edit` field) with `run_in_background`.

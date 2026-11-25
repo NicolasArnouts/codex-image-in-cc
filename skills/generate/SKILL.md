@@ -8,7 +8,7 @@ allowed-tools: Bash(node:*)
 
 Leading flags (before the prompt; `--` ends flags):
 
-- `--out <path>`: a file (`.png`, `.jpg`, `.jpeg`; other extensions are rejected) or a directory. Prefer an absolute path. Default: `./codex-images/<UTC-timestamp>-<n>.png`. An existing file is never overwritten (a `-v2`, `-v3` sibling is used) unless `--force`.
+- `--out <path>`: a file (`.png`, `.jpg`, `.jpeg`; other extensions are rejected) or a directory. Prefer an absolute path. Default: `./codex-images/<UTC-timestamp>-<n>.png`. An existing file is never overwritten (a `-v2`, `-v3` sibling is used) unless `--force` (file targets only). A leading `~/` means the home directory.
 - `--size <W>x<H>`: exact final pixel size (scaled to cover, then center-cropped; needs macOS `sips`).
 - `--transparent`: request a transparent background.
 - `--ref <path>` (also `--reference`, `--image`): reference image, repeatable, max 5. Quote paths with spaces.
