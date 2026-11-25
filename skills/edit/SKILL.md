@@ -1,14 +1,17 @@
 ---
-description: Edit an image through Codex CLI's built-in imagegen skill
-argument-hint: '<input-path> <natural-language edit request>'
+description: Edit an image through Codex CLI's built-in image generation tool
+argument-hint: '[--out <path>] [--size <W>x<H>] [--transparent] [--mode direct|skill] [--force] <input-path> <natural-language edit request>'
 allowed-tools: Bash(node:*)
 ---
 
 # Edit Codex Image
 
-The first whitespace-separated token in the arguments is the input image path; the rest is the edit prompt. Quote the path if it contains spaces (e.g. `"my photo.png" make it red`).
+Flags come first, then the input image path (the first token after the flags), then the edit prompt. Quote the path if it contains spaces (e.g. `"my photo.png" make it red`).
 
-This command runs a full Codex agent turn and typically takes 1–3 minutes. Run it with a 10-minute Bash timeout (600000 ms) so the turn is not killed mid-edit.
+- `--out <path>`: a file (`.png`, `.jpg`, `.jpeg`, `.webp`) or a directory. Prefer an absolute path. Default: `./codex-images/<UTC-timestamp>-edit-<n>.png`. An existing file is never overwritten (a `-v2` sibling is used) unless `--force`.
+- `--size <W>x<H>`, `--transparent`, `--mode direct|skill`, `--effort <e>`, `--model <slug>`: as for generate.
+
+This command runs a Codex agent turn and typically takes 30-90 seconds. Run it with a 10-minute Bash timeout (600000 ms). For more than about 3 edits use `/codex-image:batch` (manifest items with an `edit` field) with `run_in_background`.
 
 Run:
 
@@ -17,6 +20,6 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-image.mjs" edit "$ARGUMENTS"
 ```
 
 Output rules:
-- Show the command stdout to the user verbatim — Codex prints one `SAVED: <absolute path>` line per saved image.
+- Show only the `SAVED:`, `INFO:` and `USAGE:` lines from stdout to the user.
 - If the exit code is non-zero, show stderr and stop. Common failures: missing input image, missing edit prompt.
 - Do not run any additional image edits unless the user explicitly asks for another attempt.

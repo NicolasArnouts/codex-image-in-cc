@@ -1,7 +1,10 @@
 {
   "name": "codex-image-in-cc",
-  "version": "0.3.0",
+  "version": "0.4.0-nico.1",
   "type": "module",
+  "bin": {
+    "codex-image": "scripts/codex-image.mjs"
+  },
   "description": "Claude Code plugin that dispatches image generation and editing to Codex CLI's built-in imagegen skill.",
   "license": "Apache-2.0",
   "author": "KingGyuSuh",

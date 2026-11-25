@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0-nico.1] - 2026-11-25
+
+Fork of [KingGyuSuh/codex-image-in-cc](https://github.com/KingGyuSuh/codex-image-in-cc). Measured on codex-cli 0.172.0 with a ChatGPT login.
+
+Why: the old path (imagegen skill, gpt-5.6-sol high) took a median 82 s and about 138k tokens per image, and 44% of runs failed to write the requested destination (`Operation not permitted`: the workspace-write sandbox only allows the `-C` dir), leaving the file only in `$CODEX_HOME/generated_images/<thread_id>/`. Direct mode on the account default model at effort low takes about 35 s and 37k input tokens (24k cached) for the same quality; skill mode at effort medium takes about 47 s and 85k tokens.
+
+### Added
+
+- **Direct mode (default)**: Codex is told to call `image_gen.imagegen` with the prompt unchanged, with no skill read and no file operations. The wrapper copies the generated file from `$CODEX_HOME/generated_images/<thread_id>/` to the destination itself. `--mode skill` (or `CODEX_IMAGE_MODE`) keeps the imagegen-skill path, with a wrapper fallback when Codex fails to save.
+- Flags for `generate` and `edit`: `--out` (file or directory, never overwrites: `-v2`, `-v3` siblings unless `--force`), `--size WxH` (exact size via macOS `sips`, cover + center-crop), `--transparent`, `--mode`, `--effort`, `--model`, `--force`, `--` terminator, `--flag=value` forms.
+- `batch <manifest.json>` subcommand: up to 20 items, validated up front, `--parallel` 1-3, `ITEM n ok|failed` lines and exit codes 0/2/1.
+- Machine-readable stdout: `SAVED:`, `INFO:` (dimensions, alpha, source) and `USAGE:` (tokens, seconds, thread) lines; compact progress on stderr from the `codex exec --json` event stream. Hard per-turn timeout (`CODEX_IMAGE_TIMEOUT_MS`, default 540000).
+- `CODEX_IMAGE_HOME` / dedicated `~/.codex-image` home for the image runs (see README); `status` reports it.
+- `bin` entry (`codex-image`); the main guard resolves symlinks so a symlink on PATH works.
+- Hermetic end-to-end tests with a fake codex (`tests/fixtures/fake-codex.mjs`) and real JSONL fixtures.
+
+### Changed
+
+- Model and effort are independent: `--model` / `CODEX_IMAGE_MODEL` (default: no `-m`, the account default) and `--effort` / `CODEX_IMAGE_EFFORT` (default low in direct mode, medium in skill mode). `minimal` and `none` are rejected (they hard-400).
+- `status --json`: dropped the deprecated `fullAuto` alias and the `orchestrator` field; added `home`, `defaults`, `sips`, `jsonOutput`.
+
+### Removed
+
+- The orchestrator model ladder, the `codex debug models` catalog probe, the stderr monitor and the retry-without-model logic: hard-coded model slugs rot.
+
 ## [0.3.0] - 2026-09-12
 
 ### Added

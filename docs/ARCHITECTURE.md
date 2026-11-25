@@ -2,155 +2,68 @@
 
 ## Overview
 
-`codex-image-in-cc` is a thin dispatcher. The user invokes a Claude Code slash command (`/codex-image:generate`, `/codex-image:edit`, `/codex-image:status`); the SKILL.md runs `node scripts/codex-image.mjs <subcommand> "$ARGUMENTS"`; the Node script does minimal arg handling and spawns `codex exec`; Codex's bundled `imagegen` skill drives the native `image_gen` tool and saves the artifact.
+`codex-image-in-cc` is a dispatcher plus a file finisher. The user invokes a Claude Code slash command (`/codex-image:generate`, `/codex-image:edit`, `/codex-image:batch`, `/codex-image:status`) or the `codex-image` CLI; the SKILL.md runs `node scripts/codex-image.mjs <subcommand> "$ARGUMENTS"`; the Node script parses flags, spawns `codex exec --json`, reads the JSONL event stream, and then finalizes the files itself.
 
-The Node script is intentionally minimal. It does NOT parse `--out` / `--size` / `--quality` flags, validate sizes, JSON-encode prompts, or otherwise interpret the user's request. It only: splits leading reference-image paths off `generate`, splits the input path off `edit`, builds a minimal instruction prefix, and execs `codex` with the right args. All image-generation intelligence lives in Codex's `imagegen` skill.
+Design rule (0.4): **the wrapper owns files, Codex only makes pixels.** Codex's workspace-write sandbox only lets it write under `-C` and `--add-dir` dirs, and measured on codex-cli 0.172.0 about 44% of skill-mode runs failed to copy the result to the requested path (`Operation not permitted`), leaving it only in `$CODEX_HOME/generated_images/<thread_id>/`. So by default Codex is told to call `image_gen.imagegen` and nothing else, and the wrapper copies, converts, resizes and reports. The script stays stdlib-only Node.
 
 ## Repository layout
 
 ```
 codex-image-in-cc/
-├── .claude-plugin/
-│   ├── plugin.json              # Claude Code plugin manifest
-│   └── marketplace.json         # local/GitHub marketplace manifest
-├── skills/                       # user-invoked Claude Code plugin skills
+├── .claude-plugin/              # plugin.json, marketplace.json
+├── skills/                      # user-invoked Claude Code plugin skills
 │   ├── generate/SKILL.md        # 1-line: node script generate "$ARGUMENTS"
-│   ├── edit/SKILL.md            # 1-line: node script edit "$ARGUMENTS"
-│   └── status/SKILL.md          # 1-line: node script status "$ARGUMENTS"
-├── scripts/
-│   └── codex-image.mjs           # status diagnostic + generate/edit dispatcher
+│   ├── edit/SKILL.md
+│   ├── batch/SKILL.md
+│   └── status/SKILL.md
+├── scripts/codex-image.mjs      # CLI: status, generate, edit, batch
 ├── tests/
-│   └── codex-image.test.mjs      # unit tests for pure functions
-├── docs/
-│   └── ARCHITECTURE.md           # this file
-├── .github/                      # issue and PR templates
-├── CONTRIBUTING.md
-├── SECURITY.md
-├── CHANGELOG.md
-├── LICENSE                       # Apache-2.0
-├── README.md
-└── package.json
+│   ├── codex-image.test.mjs     # pure-function + hermetic end-to-end tests
+│   └── fixtures/                # real codex JSONL (direct-low, skill-medium), fake-codex.mjs
+├── docs/ARCHITECTURE.md         # this file
+└── package.json                 # includes "bin": { "codex-image": ... }
 ```
 
 ## Call flow
 
-```
-User      Claude Code      Bash (SKILL.md)     Node script        Codex CLI       image_gen
- │             │                   │                 │                  │              │
- │ /codex-image:generate "..."     │                 │                  │              │
- ├────────────►│                   │                 │                  │              │
- │             │ ① match SKILL.md  │                 │                  │              │
- │             │ ② run 1-line bash │                 │                  │              │
- │             ├──────────────────►│                 │                  │              │
- │             │                   │ ③ node script   │                  │              │
- │             │                   │   generate "$A" │                  │              │
- │             │                   ├────────────────►│                  │              │
- │             │                   │                 │ ④ split ref/input│              │
- │             │                   │                 │   image paths    │              │
- │             │                   │                 │ ⑤ build args +   │              │
- │             │                   │                 │   instruction    │              │
- │             │                   │                 │ ⑥ spawn codex    │              │
- │             │                   │                 │   stdio.in=ignore│              │
- │             │                   │                 ├─────────────────►│              │
- │             │                   │                 │                  │ ⑦ imagegen   │
- │             │                   │                 │                  ├─────────────►│
- │             │                   │                 │                  │◄─────────────┤
- │             │                   │                 │                  │ ⑧ save +     │
- │             │                   │                 │                  │   "SAVED:"   │
- │             │                   │                 │ ⑨ stdout/stderr  │              │
- │             │                   │                 │   pass-through   │              │
- │             │                   │                 │◄─────────────────┤              │
- │             │                   │ ⑩ stdout passes through            │              │
- │             │                   │◄────────────────┤                  │              │
- │             │ ⑪ show stdout     │                 │                  │              │
- │◄────────────┤                   │                 │                  │              │
-```
-
-The actual `codex` invocation:
+1. Parse leading flags (`parseLeadingFlags`, using `splitFirstToken`): `--out --size --transparent --ref --mode --effort --model --force`, `--` terminator, `--flag=value` forms. Unknown `--xyz` starts the prompt.
+2. Resolve settings: model = flag > `CODEX_IMAGE_MODEL` > none (no `-m`); effort = flag > `CODEX_IMAGE_EFFORT` > mode default (direct low, skill medium; `minimal`/`none` rejected, they hard-400); mode = flag > `CODEX_IMAGE_MODE` > direct.
+3. Resolve `CODEX_HOME`: `CODEX_IMAGE_HOME` > `~/.codex-image` (if it exists) > inherited `CODEX_HOME` > `~/.codex`. It is passed to the child as `CODEX_HOME`; all `generated_images` lookups use it.
+4. Plan the output (`resolveOutTarget`): `--out` ending in an image extension is a file, anything else a directory, default `<cwd>/codex-images/`. Existing files are never overwritten (`-v2`, `-v3`) unless `--force`.
+5. Build the instruction (pure builders) and spawn:
 
 ```
-codex exec --sandbox workspace-write -c approval_policy="never" --skip-git-repo-check [-m <model> -c model_reasoning_effort=<effort>] [--image <abs-reference>...] -C <cwd> -- "<minimal instruction>
-
-User request:
-
-<remaining user request>"
+codex exec --json --sandbox workspace-write -c approval_policy="never" --skip-git-repo-check \
+  -c model_reasoning_effort="<e>" [-m <model>] [--image <abs>]... -C <cwd> --add-dir <out dir> \
+  -o <tmp last-message file> -- <instruction>
 ```
 
-for `generate`, and:
+   stdin is `ignore`. In skill mode, absolute image paths found in the prompt add `--add-dir` for their nearest existing ancestor.
+6. Parse stdout JSONL line by line (non-JSON ignored): `thread.started` (thread id), `item.completed` `agent_message` (progress), `item.completed` `error` (non-fatal warning, deduped), `turn.completed` (usage), `turn.failed` / `error` (failure). Progress goes to stderr; child stderr is drained and only its last 4000 chars are kept (printed on failure). A hard timeout (`CODEX_IMAGE_TIMEOUT_MS`, default 540000) sends SIGTERM, then SIGKILL after 5 s.
+7. Finalize (after the child exits): generated files = images in `<home>/generated_images/<thread_id>/` by mtime (without a thread id: files newer than the spawn). Skill mode first trusts files Codex saved itself (the out file, or `SAVED:` lines, modified after spawn) and otherwise falls back to the generated files. Direct mode copies to the planned destinations (png to jpg/webp via `sips -s format`, else warn and keep png), then `--size` (cover + center-crop via `sips`), then reads dimensions and alpha via `sips -g`.
+8. Print the stdout contract: `SAVED:`, `INFO:`, `USAGE:`. Exit 0 if at least one image was saved (a non-zero codex exit with images still saves them, with a warning), else 1.
 
-```
-codex exec --sandbox workspace-write -c approval_policy="never" --skip-git-repo-check [-m <model> -c model_reasoning_effort=<effort>] --image <abs-input> -C <cwd> -- "<minimal instruction>
+`batch` validates the whole manifest first, then runs one turn per item through the same `runImageJob` path with a worker pool (`--parallel` 1-3). Finalization is synchronous, so destination planning cannot race between items in one process.
 
-User edit request:
-
-<raw edit request>"
-```
-
-for `edit`, both with `stdio.in = "ignore"` (equivalent to `< /dev/null`).
-
-The minimal instruction (about 6 lines, in `scripts/codex-image.mjs`):
-
-```
-Use the imagegen skill. Built-in image_gen tool path only — do not use the CLI fallback.
-
-If the user did not specify an output path, save under ./codex-images/<UTC-timestamp>-<n>.png.
-
-For each saved image, print exactly one line:
-SAVED: <absolute path>
-
-User request:
-
-<...>
-```
-
-When `generate` receives leading `--ref <path>`, `--reference <path>`, or `--image <path>` arguments, the script strips those reference paths from the prompt, validates that the files exist, attaches each path with `codex exec --image`, and adds a short note that lists each reference's absolute path and tells the child Codex turn to treat them as generation references rather than edit targets. For `edit`, the instruction likewise names the edit target's absolute path. Listing the absolute paths in the instruction text matters on Codex CLI 0.144+ — see "Reference image attachment semantics" below.
-
-For `/codex-image:status`, the Node script does a multi-call diagnostic that is awkward in pure Bash:
-
-- `codex --version` — semver compare against `0.142.0`
-- `codex login status` — parse "Logged in" line
-- `codex exec --sandbox workspace-write --help` — verify the headless sandbox mode the wrapper dispatches with is still accepted
-- `codex exec --help` — verify `--image` attachment support exists (probed separately, so a rejected headless flag cannot mask it)
-- File check on `~/.codex/skills/.system/imagegen/SKILL.md`
-- `codex debug models` — resolve the image orchestrator model/effort from the account's live catalog (see "Image orchestrator model ladder"); a failed probe degrades to the codex default and is not a readiness failure
+`status` runs `codex --version`, `codex login status` (with the resolved image home), `codex exec --sandbox workspace-write --help`, and `codex exec --help` (for `--image` and `--json`), and reports the home, whether the imagegen skill exists under it, the defaults and `sips` availability. `--json` prints the same as JSON.
 
 ## Load-bearing edge cases
 
-Contracts the plugin depends on. Each lives directly in `scripts/codex-image.mjs` — keep them aligned with this section in the same PR.
+Contracts the plugin depends on. Each lives in `scripts/codex-image.mjs`; keep them aligned with this section in the same PR.
 
 ### SKILL.md bash is NOT executed verbatim
 
-When a slash command runs, Claude Code passes the SKILL.md template (with `$ARGUMENTS` substituted) to the model, and the model decides what bash to actually run. Empirically the model:
-
-- Pre-evaluates `$(...)` command substitutions in its head and inlines the results.
-- May treat literal `$1` / `$N` inside single-quoted strings as bash positionals to substitute.
-- Sometimes typos `==` to `=` when paraphrasing.
-
-This means **SKILL.md bash must not contain in-bash parsing logic**. Any `awk '...$1...'`, `cut`, `${RAW%% *}` etc. inside the SKILL.md script is at risk of model-side rewriting. The mitigation is to keep SKILL.md to a single-line invocation of a Node script and do all parsing inside Node (which the model does not see or rewrite).
-
-This is the reason `scripts/codex-image.mjs` exists for `generate` / `edit` even though the plugin's spirit is "stay thin".
+When a slash command runs, Claude Code passes the SKILL.md template (with `$ARGUMENTS` substituted) to the model, and the model decides what bash to actually run. Empirically the model pre-evaluates `$(...)` substitutions, may treat literal `$1` / `$N` in single-quoted strings as positionals, and sometimes rewrites `==` to `=`. So **SKILL.md bash must not contain in-bash parsing logic**: keep it to a single-line invocation of the Node script and do all parsing in Node. This is why the flag grammar lives in the script and the SKILL.md files only document it.
 
 ### stdin trap
 
-`codex exec` must be invoked with stdin redirected to `/dev/null` (or `stdio: "ignore"` in Node) in non-TTY contexts. Without it, it treats piped stdin as an appendable `<stdin>` block and hangs waiting for EOF. This is not obvious from `codex exec --help`. The Node script uses `stdio: ["ignore", "inherit", "inherit"]` for this reason.
+`codex exec` must be invoked with stdin ignored (`stdio: ["ignore","pipe","pipe"]`). Otherwise, in non-TTY contexts it treats piped stdin as an appendable `<stdin>` block and hangs waiting for EOF. This is not obvious from `codex exec --help`.
 
 ### Quoted-arg passing through Bash → Node → Codex
 
 The SKILL.md bash is `node ... <subcommand> "$ARGUMENTS"`. Claude Code substitutes `$ARGUMENTS` into the bash text before bash parses it. The double quotes around `"$ARGUMENTS"` ensure bash treats the substituted text as one positional argument to Node, even if it contains spaces or shell metacharacters. Node receives it as a single string in `process.argv`. Codex receives the prompt as a single argv element from Node's `spawn` call (no shell re-interpretation).
 
 `$(...)`, backticks, and `$X` in the user's prompt therefore reach Codex as literal text.
-
-### Generate reference image parsing
-
-`/codex-image:generate` accepts only a small leading flag grammar before the natural-language prompt:
-
-- `--ref <path>`
-- `--reference <path>`
-- `--image <path>`
-
-The flags are repeatable up to 5 references — the built-in image tool caps reference inputs at 5 (schema-enforced since Codex CLI 0.144), and the wrapper rejects more before spawning Codex rather than letting references be silently dropped. Quoted paths with spaces are handled by `splitFirstToken`, matching the edit path parser. The script strips only these leading flags, resolves each path against the current working directory, rejects missing files before spawning Codex, and passes each valid file as `codex exec --image <abs-path>`.
-
-This keeps reference images mechanical while preserving the "natural language owns output control" rule: sizes, counts, quality, output paths, transparency, and creative direction still live inside the remaining prompt and are interpreted by `imagegen`.
 
 ### Sandbox mode, not `--full-auto` — and an explicit approval override
 
@@ -168,14 +81,6 @@ The `status` `--image` check runs its own plain `codex exec --help` rather than 
 
 The Node script passes `--skip-git-repo-check` to `codex exec` because image generation should work in asset folders and scratch workspaces, not only git repositories.
 
-### Output path is indirect
-
-First-hop output lands in `~/.codex/generated_images/<session-id>/...`; the `imagegen` skill then copies it into the workspace per its save-path policy. The staging filename is version-dependent — `ig_<hash>.png` on the pre-0.144 built-in tool, `<call-id>.png` on the 0.144+ extension — and the model cannot choose the output location at the tool level, so this two-hop flow holds on every supported version. The Node script's instruction asks Codex to print one `SAVED: <absolute path>` line per saved image — users (and Claude) parse stdout to learn the final locations and never depend on the staging filename.
-
-### Resolution is not guaranteed
-
-The built-in `image_gen` tool may return a size larger than requested (observed: 1024×1024 request → 1254×1254 response). The `imagegen` skill itself handles resize via `sips` or Pillow. Do not assume exact pixel dimensions straight out of the raw tool call.
-
 ### Edit input path parsing
 
 `/codex-image:edit` splits `$ARGUMENTS` via a regex in `scripts/codex-image.mjs`'s `splitFirstToken`:
@@ -185,25 +90,19 @@ The built-in `image_gen` tool may return a size larger than requested (observed:
 
 The Node check `fs.existsSync(inputPath)` rejects bad paths early with a clear message before spawning `codex`.
 
-### Reference image attachment semantics
+### Direct mode vs skill mode
 
-For generate, `--image` is an attachment mechanism, not a request to edit those files. The instruction prefix labels attached images as references, lists their absolute paths, and tells Codex to use them for style, identity, composition, mood, or subject guidance according to the user's prompt.
+Direct mode (default) tells Codex: call `image_gen.imagegen` with the request unchanged, do not read skill files, run shell commands or copy anything, and reply `DONE`. It avoids loading the imagegen skill (large token cost) and avoids every sandbox write failure, because Codex never writes the destination. Skill mode keeps the upstream `Use the imagegen skill...` prompt with a "save to <path>, print `SAVED: <path>`" paragraph and exists for cases where the skill's own prompt handling is wanted. Either way the wrapper verifies what exists on disk instead of trusting the model's report.
 
-The conditioning mechanism changed in Codex CLI 0.144.0: image generation moved to an extension-backed tool (`image_gen.imagegen`) whose image inputs are local absolute paths the Codex-side model passes itself (`referenced_image_paths`, max 5, also used for edit targets). Attached turn images are no longer implicitly fed to the image tool. The wrapper therefore lists each reference's (and the edit target's) absolute path in the instruction text so the model can pass them to the tool, while keeping the `codex exec --image` attachments so the model can see the pixels for prompt-writing and validation — and so the 0.142–0.143 built-in tool path keeps working. The wrapper itself never calls the image tool and never passes `referenced_image_paths`; the Codex-side `imagegen` skill owns that decision.
+The built-in tool takes `prompt`, `transparent_background`, `referenced_image_paths` (max 5), `num_last_images_to_include` and `gif`, and has no size parameter (it returns for example 1254x1254), so `--size` is applied by the wrapper and the instruction only asks Codex to compose for the W:H aspect ratio.
 
-### Image orchestrator model ladder
+### Reference and edit images
 
-codex image generation is an agent turn (the "orchestrator") that decides to call the built-in image tool, interprets the prompt, conditions the reference pixels, and holds the requested aspect. The image pixels come from the image tool (gpt-image) regardless, but a stronger orchestrator model/effort makes that turn more reliable. Hardcoding one model would break accounts that cannot access it — notably ChatGPT Free — so the wrapper selects from the account's live catalog instead:
+`--image` attaches files for model visibility; since Codex CLI 0.144 the tool's image inputs are local absolute paths passed as `referenced_image_paths` (max 5, also for edit targets), so the instructions list each absolute path. References are not edit targets and must not be modified.
 
-1. Probe `codex debug models`, which renders the account's model catalog as JSON. The wrapper keeps only `models[]` with `visibility: "list"` (account-selectable) and records each model's `supported_reasoning_levels[].effort`.
-2. Walk `CODEX_IMAGE_ORCHESTRATOR_LADDER` — `gpt-5.6-luna` high → `gpt-5.6-terra` medium → `gpt-5.6-sol` high → `gpt-5.6-sol` low — and pick the first rung whose model is in the catalog and whose effort that model supports.
-3. Pass the pick as `-m <model> -c model_reasoning_effort="<effort>"`. The `-c` value is parsed as TOML, so the effort string is JSON-quoted.
+### Model and effort are never hard-coded
 
-If the probe fails (codex missing, not logged in, offline) or no rung matches (e.g. a Free account with none of those models), the wrapper adds no `-m`/`-c` flags and codex uses its own config default — identical to the pre-ladder behavior, so image generation never regresses. The probe is bounded by a 15-second timeout: `codex debug models` runs synchronously before every generate/edit dispatch, and a stalled probe (bad network/proxy, hung catalog refresh) must count as an unavailable catalog rather than block the command from ever reaching the image turn.
-
-The ladder pick is also best-effort at spawn time, not just at probe time. The catalog can list a model the actual backend refuses — the canonical case is a custom/API-key `model_provider` that does not serve official slugs while the bundled catalog remains visible. Such a rejection kills the `codex exec` turn at startup (verified on 0.144.5 and 0.154.0: HTTP 400 `"The 'X' model is not supported…"` on stderr, empty stdout, no image tokens spent). When a **ladder-selected** orchestrator fails that way — non-zero exit, a model/effort-rejection signature in codex's `ERROR:` record (`isOrchestratorRejection`), and no `codex` / `exec` event line before it (`turnHadStarted`) — the wrapper retries once with no `-m`/`-c`, landing on the codex config default that worked before the ladder existed. Unrelated failures (quota, auth, transport) do not match the signature and are not retried, so a real image-turn failure is never double-billed. The classification looks only at codex's own stderr, via a streaming monitor (`createStderrMonitor`) fed as chunks arrive rather than a post-hoc scan of a bounded tail. `codex exec` echoes the full instruction under a `user` heading and later prints agent messages and tool output there too, so the monitor skips the echo by matching the exact text the wrapper sent (prompt lines can then neither masquerade as events nor be mistaken for an error record), tracks a sticky `started` flag over the entire remaining stream — a bare `codex` (agent message) or `exec` (tool call) line, ANSI stripped, since codex colours stderr under `FORCE_COLOR` even when piped — so that however much a tool printed the evidence is never lost to tail truncation, and keeps a bounded tail of codex's own output for the error record (everything from the first `ERROR:` line to the end, because a pretty-printed JSON rejection from a custom provider spans several lines). If the echo never matches (a codex version that stops echoing verbatim), the text is classified as codex's own once a size limit is hit or the process ends — the conservative direction, since prompt lines can then only suppress a retry. `shouldRetryWithoutOrchestrator` is the pure decision over that result: not started, and a rejection signature in the record.
-
-Setting both `CODEX_IMAGE_MODEL` and `CODEX_IMAGE_EFFORT` forces a specific pair and skips the probe entirely; setting only one is a hard error (an override must be explicit on both axes), and a forced pair never falls back — the user asserted it, so its rejection must surface as an error instead of a silent downgrade. `/codex-image:status` reports the resolved orchestrator and only fails readiness on an inconsistent override, never on an unavailable ladder model.
+An earlier version kept a ladder of model slugs probed against `codex debug models`; the slugs rotted (the ladder picked a legacy model). Now `-m` is only passed when the user asks (`--model` / `CODEX_IMAGE_MODEL`); otherwise Codex uses the account default. Reasoning effort is always passed (`-c model_reasoning_effort="<e>"`), defaulting to low in direct mode.
 
 ### Windows codex spawning
 
@@ -211,31 +110,18 @@ On Windows, npm installs `codex` as a `codex.cmd` shim. `spawn("codex", ...)` do
 
 ### Token accounting
 
-Agent tokens count against the user's Codex usage limits; a typical single-image `quality=low` turn is around 30k agent tokens on top of the image-generation cost itself. Do not hide this from users.
+Agent tokens count against the user's Codex usage limits. Measured on 0.172.0: direct mode at low about 37k input tokens (24k cached) per image; skill mode at medium about 85k; the old skill path at high about 138k. `USAGE:` reports the real numbers from `turn.completed`. Do not hide this from users.
 
-## Why so thin?
+## Tests
 
-An earlier iteration of `scripts/codex-image.mjs` was 600 lines that:
-
-- Parsed `--out` / `--size` / `--quality` / `--force` / `--dry-run` flags.
-- Built a 27-line "control fields are authoritative" English instruction with JSON-encoded prompt, redundant guards, and prose preambles.
-- Validated PNG dimensions and pretty-printed metadata.
-
-Two problems pushed the simplification:
-
-1. **Flattening user intent.** A single `--out` flag couldn't represent multi-image requests ("5 logo variations") that `imagegen` handles natively.
-2. **Distrusting the receiver.** Codex CLI is itself an LLM agent harness. The wrapper's prose lectures duplicated guards already present inside `imagegen`.
-
-A second iteration tried to remove the Node wrapper entirely for `generate` / `edit` and put a Bash heredoc directly in SKILL.md. That broke on the "SKILL.md bash is not verbatim" edge case above — the model rewrote the bash, sometimes incorrectly.
-
-The current architecture is the synthesis: a thin Node wrapper does only the things that NEED a deterministic environment (arg split, codex spawn, exit-code propagation) with a minimal ~6-line instruction prefix. Everything else — prompt augmentation, transparency, validation, save-path policy, multi-image handling, resize — stays in Codex's `imagegen` skill.
+`npm test` runs `node --test`. Pure-function tests cover flag parsing, out-path planning, codex args, the JSONL parser (real fixtures in `tests/fixtures/`), skill-mode `--add-dir` scanning, batch validation and home resolution. Hermetic end-to-end tests run the CLI against `tests/fixtures/fake-codex.mjs` (via `CODEX_IMAGE_CODEX_BIN` and a temp `CODEX_IMAGE_HOME`): it prints JSONL, writes a real small PNG into `generated_images/<thread>/` and the `-o` file. No test calls the real codex or the network.
 
 ## Maintenance discipline
 
-- **Stay thin.** The Node wrapper does arg splitting and codex spawning. Nothing else. Image-generation intelligence lives in `imagegen`.
-- **No in-bash parsing in SKILL.md.** Single-line `node script <cmd> "$ARGUMENTS"` only. Anything more complex must live in the Node script.
-- **Contract changes propagate here first.** If Codex CLI changes the headless invocation contract (`< /dev/null`, `--sandbox workspace-write -c approval_policy="never"`, `--skip-git-repo-check`, `--image`, `-m` / `-c model_reasoning_effort`, the `codex debug models` catalog shape, the `image_gen.imagegen` extension tool and its `referenced_image_paths` input, `~/.codex/generated_images/` path, `imagegen` skill id, `codex login status`), update `scripts/codex-image.mjs` and the **Load-bearing edge cases** section above in the same PR.
-- **Scope is image generation.** A new Codex built-in tool (`web_search`, `browser`) deserves a separate plugin.
+- **Wrapper owns files.** Do not let Codex write the destination in the default path.
+- **No in-bash parsing in SKILL.md.** Single-line `node script <cmd> "$ARGUMENTS"` only.
+- **Contract changes propagate here first.** If Codex CLI changes the headless contract (stdin ignored, `--json` event shapes, `--sandbox workspace-write -c approval_policy="never"`, `--skip-git-repo-check`, `--image`, `--add-dir`, `-o`, `-c model_reasoning_effort`, the `image_gen.imagegen` tool inputs, `<home>/generated_images/<thread_id>/`), update this document and the tests in the same change. Refresh the JSONL fixtures from a real run when event shapes change.
+- **Scope is image generation.** A new Codex built-in tool deserves a separate plugin.
 
 ## Relationship to openai/codex-plugin-cc
 

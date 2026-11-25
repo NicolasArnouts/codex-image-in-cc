@@ -4,14 +4,14 @@
 [![License](https://img.shields.io/github/license/KingGyuSuh/codex-image-in-cc.svg)](LICENSE)
 [![Node](https://img.shields.io/badge/node-%3E%3D18.18-brightgreen.svg)](https://nodejs.org)
 
-Claude Code plugin that exposes Codex CLI's built-in `imagegen` skill as `/codex-image:*` user-invoked plugin skills.
+Claude Code plugin that generates and edits images through Codex CLI's built-in image generation tool, as `/codex-image:*` user-invoked plugin skills and as a `codex-image` command-line tool. This is the `0.4.0-nico.1` fork of [KingGyuSuh/codex-image-in-cc](https://github.com/KingGyuSuh/codex-image-in-cc).
 
-The plugin does not implement image generation itself. Each plugin skill dispatches to `codex exec --sandbox workspace-write` and lets Codex's `imagegen` skill drive the built-in `image_gen` tool, use attached reference/edit images, save the final artifact, and print a `SAVED: <path>` line for each output.
+The plugin does not implement image generation itself. The wrapper runs `codex exec --json --sandbox workspace-write`, lets Codex call the built-in `image_gen` tool, and then handles the files itself: it copies the result to your `--out` path, applies `--size`, and prints `SAVED:` / `INFO:` / `USAGE:` lines. Codex only makes pixels.
 
 ## Requirements
 
 - Claude Code with plugin support.
-- `@openai/codex` CLI v0.142.0 or later (v0.144+ recommended — it moves image generation to the extension-backed tool the instruction prefixes are written for). Codex CLI 0.151+ removed `--full-auto` from `codex exec`; plugin 0.2.1+ dispatches with `--sandbox workspace-write` instead, which older and current releases both accept.
+- `@openai/codex` CLI v0.142.0 or later (v0.144+ recommended — it moves image generation to the extension-backed tool the instruction prefixes are written for). The wrapper dispatches with `--sandbox workspace-write` and `--json` (0.151+ removed `--full-auto`).
 - An active `codex login` session.
 - Node.js 18.18 or later.
 
@@ -37,36 +37,88 @@ claude plugin install codex-image@codex-image-in-cc
 
 Then restart Claude Code if needed. Default install scope is `user`; pass `--scope project` or `--scope local` to limit installation.
 
-## Plugin Skills
+## Usage
 
 ```bash
 /codex-image:status
-/codex-image:generate "A watercolor moonlit library, save to images/library.png at 1024x1024"
-/codex-image:generate --ref style.png --ref "character ref.png" "A 9:16 scene using those references, save to images/scene.png"
-/codex-image:generate "5 logo variations of a brass compass on white, save under images/logos/"
-/codex-image:edit input.png "Replace the background with a clean white studio backdrop, save to edited.png"
+/codex-image:generate --out images/library.png --size 1024x1024 "A watercolor moonlit library"
+/codex-image:generate --ref style.png --ref "character ref.png" --out images/scene.png "A 9:16 scene using those references"
+/codex-image:edit --out edited.png input.png "Replace the background with a clean white studio backdrop"
+/codex-image:batch manifest.json --parallel 2
 ```
 
-Apart from leading reference-image flags on `generate` and the input-path split on `edit`, the natural-language prompt is passed through to Codex's `imagegen` skill. Express output paths, sizes, quality, count, transparency, etc. as natural language inside the prompt — `imagegen` interprets them. Defaults: when no path is specified, files land under `./codex-images/<UTC-timestamp>-<n>.png`.
+### Flags (`generate`, `edit`)
 
-For `/codex-image:generate`, leading `--ref <path>`, `--reference <path>`, or `--image <path>` arguments are attached to the Codex turn via `codex exec --image` and treated as generation references, not edit targets. Repeat the flag for multiple references (at most 5 — the built-in image tool's reference cap). Quote paths with spaces. Use `--` before the prompt if the prompt itself starts with a flag-like token.
+Flags go before the prompt (for `edit`: before the input path). `--` ends flags; `--flag=value` works; an unknown `--xyz` starts the prompt.
 
-For `/codex-image:edit`, the first whitespace-separated token is the input image path. Quote it if the path contains spaces (e.g. `/codex-image:edit "my photo.png" tint blue`).
+| Flag | Meaning |
+|---|---|
+| `--out <path>` | A file (`.png`, `.jpg`, `.jpeg`, `.webp`, any case) or otherwise a directory. Default: `./codex-images/<UTC-timestamp>-<n>.png` (edit: `...-edit-<n>.png`). Parent dirs are created. Several images into one file path become `<stem>-1`, `<stem>-2`. |
+| `--force` | Overwrite an existing `--out` file. Default: never overwrite; use `hero-v2.png`, `hero-v3.png`. |
+| `--size <W>x<H>` | Exact final size (max 8192): scale to cover, then center-crop. Needs macOS `sips`; otherwise a warning is printed and the file is kept as is. |
+| `--transparent` | Request a transparent background. |
+| `--ref <path>` | Reference image (also `--reference`, `--image`; generate only; max 5; must exist). |
+| `--mode direct\|skill` | `direct` (default, `CODEX_IMAGE_MODE`): call the image tool directly. `skill`: use Codex's imagegen skill. |
+| `--effort <e>` | `low`, `medium`, `high`, `xhigh`, `max`, `ultra` (`CODEX_IMAGE_EFFORT`). Default low (direct) / medium (skill). `minimal` and `none` are rejected. |
+| `--model <slug>` | Model for the turn (`CODEX_IMAGE_MODEL`). Default: none, so Codex uses the account default. |
 
-## Image model
+Quote paths with spaces. The built-in tool has no size parameter (it returns for example 1254x1254), which is why `--size` is applied by the wrapper.
 
-Image generation runs as a Codex agent turn (the "orchestrator") that calls the built-in image tool. The plugin picks a stronger orchestrator model/effort when your account has one, without breaking accounts that don't: it reads your live model catalog via `codex debug models` and selects the first available rung of a preference ladder —
+### Output
 
-`gpt-5.6-luna` high → `gpt-5.6-terra` medium → `gpt-5.6-sol` high → `gpt-5.6-sol` low
+stdout carries only these lines (progress goes to stderr):
 
-If none of those are available to your account (for example on ChatGPT Free), or the probe fails, the plugin passes no model flag and Codex uses its own configured default — image generation still works. `/codex-image:status` shows which orchestrator was resolved.
+```
+SAVED: <absolute path>
+INFO: <absolute path> <W>x<H> alpha=<yes|no> source=<generated path>     (when sips is available)
+USAGE: mode=<m> model=<slug|account-default> effort=<e> secs=<n> input=<n> cached=<n> output=<n> thread=<id>
+```
 
-To force a specific model and effort, set **both** environment variables (setting only one is an error):
+Exit 0 if at least one image was saved (even if Codex itself exited non-zero), otherwise 1 with a reason on stderr. A turn is cut off after `CODEX_IMAGE_TIMEOUT_MS` (default 540000).
+
+### Batch
+
+`batch <manifest.json> [--mode m] [--effort e] [--model s] [--parallel N]`, where the manifest is a JSON array (max 20) of:
+
+```json
+[
+  { "prompt": "a brass compass on white", "out": "logos/compass.png", "size": "512x512" },
+  { "prompt": "make it blue", "edit": "logos/compass.png", "out": "logos/compass-blue.png" },
+  { "prompt": "poster in this style", "refs": ["style.png"], "transparent": false, "force": true }
+]
+```
+
+Relative paths resolve against the manifest's folder. The manifest is validated completely before anything runs. `--parallel` is 1 (default) to 3. stdout gets each item's `SAVED:` / `INFO:` lines, `ITEM <n> ok|failed <reason>`, and a final `USAGE: batch items=<n> ok=<k> secs=<s>`. Exit 0 if all items succeeded, 2 if some failed, 1 if none.
+
+### Command line
+
+`scripts/codex-image.mjs` is also a CLI (`bin: codex-image`). Put a symlink on your PATH:
 
 ```bash
-export CODEX_IMAGE_MODEL=gpt-5.6-terra
-export CODEX_IMAGE_EFFORT=high   # none|minimal|low|medium|high|xhigh|max|ultra
+ln -s "$PWD/scripts/codex-image.mjs" ~/.local/bin/codex-image
+codex-image generate --out ~/Pictures/fox.png "a fox in the snow"
 ```
+
+## Image home (`~/.codex-image`)
+
+Image runs use their own `CODEX_HOME` so a heavy personal Codex config (plugins, MCP servers, many skills) does not inflate every image turn. Resolution order: `CODEX_IMAGE_HOME`, then `~/.codex-image` if that directory exists, then an inherited `CODEX_HOME`, then `~/.codex`. Generated files are looked up under `<home>/generated_images/<thread_id>/`. `status` shows which one is used.
+
+Create the dedicated home once (it reuses your existing login):
+
+```bash
+mkdir ~/.codex-image && ln -s ~/.codex/auth.json ~/.codex-image/auth.json
+cat > ~/.codex-image/config.toml <<'TOML'
+# Minimal config for image runs. No model pin: the account default is used.
+approval_policy = "never"
+sandbox_mode = "workspace-write"
+TOML
+```
+
+Do not pin `model` in that file unless you want to; the wrapper only passes `-m` when you give `--model` or `CODEX_IMAGE_MODEL`. Skill mode needs the imagegen skill under `<home>/skills/.system/imagegen/`; Codex installs it on first run.
+
+## Cost and speed
+
+Measured on codex-cli 0.172.0 with a ChatGPT login: direct mode at effort low is about 35 s and 37k input tokens (24k cached) per image; skill mode at medium about 47 s and 85k tokens; the old skill path at high was a median 82 s and about 138k tokens. Image generation always consumes a Codex agent turn plus the built-in image tool usage.
 
 ## Development
 

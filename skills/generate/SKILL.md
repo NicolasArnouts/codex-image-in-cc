@@ -1,14 +1,20 @@
 ---
-description: Generate one or more images, optionally with reference images, through Codex CLI's built-in imagegen skill
-argument-hint: '[--ref <reference-image> ...] <natural-language image request>'
+description: Generate one or more images, optionally with reference images, through Codex CLI's built-in image generation tool
+argument-hint: '[--out <path>] [--size <W>x<H>] [--transparent] [--ref <image> ...] [--mode direct|skill] [--effort <e>] [--force] <image request>'
 allowed-tools: Bash(node:*)
 ---
 
 # Generate Codex Image
 
-Leading `--ref <path>`, `--reference <path>`, or `--image <path>` arguments are reference images for generation, not edit targets. Repeat the flag for multiple references (max 5); quote paths with spaces.
+Leading flags (before the prompt; `--` ends flags):
 
-This command runs a full Codex agent turn and typically takes 1–3 minutes (longer for multiple images). Run it with a 10-minute Bash timeout (600000 ms) so the turn is not killed mid-generation.
+- `--out <path>`: a file (`.png`, `.jpg`, `.jpeg`, `.webp`) or a directory. Prefer an absolute path. Default: `./codex-images/<UTC-timestamp>-<n>.png`. An existing file is never overwritten (a `-v2`, `-v3` sibling is used) unless `--force`.
+- `--size <W>x<H>`: exact final pixel size (scaled to cover, then center-cropped; needs macOS `sips`).
+- `--transparent`: request a transparent background.
+- `--ref <path>` (also `--reference`, `--image`): reference image, repeatable, max 5. Quote paths with spaces.
+- `--mode direct|skill` (default `direct`, fast), `--effort <low|medium|high|xhigh|max|ultra>`, `--model <slug>` (default: account default).
+
+This command runs a Codex agent turn and typically takes 30-90 seconds per image. Run it with a 10-minute Bash timeout (600000 ms). For more than about 3 images use `/codex-image:batch` with `run_in_background` instead of repeated calls.
 
 Run:
 
@@ -17,6 +23,6 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-image.mjs" generate "$ARGUMENTS"
 ```
 
 Output rules:
-- Show the command stdout to the user verbatim — Codex prints one `SAVED: <absolute path>` line per saved image.
+- Show only the `SAVED:`, `INFO:` and `USAGE:` lines from stdout to the user; progress goes to stderr and need not be repeated.
 - If the exit code is non-zero, show stderr and stop.
 - Do not run any additional image generation unless the user explicitly asks for another attempt.
