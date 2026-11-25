@@ -190,8 +190,14 @@ function splitFirstToken(raw) {
   if (inlineQuoted) {
     return { input: `${inlineQuoted[1]}=${unescapeQuotes(inlineQuoted[3])}`, prompt: (inlineQuoted[4] ?? "").trim() };
   }
+  // A token that opens a quote it never closes: flag values and edit inputs reject it
+  // (`--out "unterminated a cat` must not become a literal `"unterminated` folder).
+  const unterminated = /^(['"])/.test(text) || /^--[\w-]+=['"]/.test(text);
   const unquoted = text.match(/^(\S+)(?:\s+([\s\S]+))?$/);
   if (unquoted) {
+    if (unterminated) {
+      return { input: unquoted[1], prompt: (unquoted[2] ?? "").trim(), unterminated: true };
+    }
     return { input: unquoted[1], prompt: (unquoted[2] ?? "").trim() };
   }
   return { input: null, prompt: null };
@@ -216,8 +222,13 @@ function makeSource(input) {
   let rest = String((Array.isArray(input) ? input[0] : input) ?? "").trim();
   return {
     peek: () => splitFirstToken(rest).input,
-    take: () => {
+    // strict: the token is a value (flag value, edit input, batch token), so an
+    // unterminated quote is an error instead of a literal quote character.
+    take: ({ strict = false } = {}) => {
       const first = splitFirstToken(rest);
+      if (strict && first.unterminated) {
+        throw new Error(`Unterminated quote in ${JSON.stringify(first.input)}; close the quote or escape it.`);
+      }
       rest = first.prompt ?? "";
       return first.input;
     },
@@ -277,14 +288,14 @@ function parseLeadingFlags(input, kind) {
     }
 
     if (isReference || VALUE_FLAGS.has(name)) {
-      source.take();
+      source.take({ strict: inlineValue !== null });
       let value = inlineValue;
       if (value === null) {
         value = source.peek();
         if (value && value.startsWith("--")) {
           value = null;
         } else if (value) {
-          source.take();
+          source.take({ strict: true });
         }
       }
       if (!value) {
@@ -325,7 +336,7 @@ function parseGenerateArguments(raw) {
 // edit [flags] <input> <prompt>
 function parseEditArguments(raw) {
   const { options, source } = parseLeadingFlags(raw, "edit");
-  const input = source.take();
+  const input = source.take({ strict: true });
   return { ...options, input: input ?? null, prompt: source.rest() };
 }
 
@@ -337,7 +348,7 @@ function tokenize(input) {
   }
   const tokens = [];
   const source = makeSource(input);
-  for (let token = source.take(); token; token = source.take()) {
+  for (let token = source.take({ strict: true }); token; token = source.take({ strict: true })) {
     tokens.push(token);
   }
   return tokens;
@@ -346,7 +357,7 @@ function tokenize(input) {
 function parseBatchArguments(raw) {
   // A lone argv element that is an existing file is the manifest path as is (it may
   // contain spaces); any other lone string is split by the quote-aware tokenizer.
-  const lone = Array.isArray(raw) && raw.length === 1 && fs.existsSync(path.resolve(String(raw[0])));
+  const lone = Array.isArray(raw) && raw.length === 1 && fs.existsSync(resolveUserPath(process.cwd(), String(raw[0])));
   const tokens = lone ? [String(raw[0])] : tokenize(raw);
   const options = { manifest: null, mode: null, effort: null, model: null, parallel: 1 };
   for (let index = 0; index < tokens.length; index += 1) {
@@ -392,9 +403,27 @@ function parseBatchArguments(raw) {
   return options;
 }
 
+// A leading `~/` (or a bare `~`) means the home directory, as in a shell. Slash-command
+// text and manifests never pass through a shell, so without this `--out ~/x.png` would
+// create a literal `./~/` folder.
+function expandHome(file, homedir = os.homedir()) {
+  const text = String(file);
+  if (text === "~") {
+    return homedir;
+  }
+  if (text.startsWith("~/")) {
+    return path.join(homedir, text.slice(2));
+  }
+  return text;
+}
+
+function resolveUserPath(base, file) {
+  return path.resolve(base, expandHome(file));
+}
+
 function resolveExistingImagePaths(inputs, cwd, label) {
   return inputs.map((input) => {
-    const resolved = path.resolve(cwd, input);
+    const resolved = resolveUserPath(cwd, input);
     if (!fs.existsSync(resolved)) {
       throw new Error(`${label} image not found: ${resolved}`);
     }
@@ -417,7 +446,7 @@ function resolveOutTarget(out, cwd) {
   if (!out) {
     return { kind: "dir", path: path.resolve(cwd, "codex-images"), dir: path.resolve(cwd, "codex-images") };
   }
-  const resolved = path.resolve(cwd, out);
+  const resolved = resolveUserPath(cwd, out);
   const ext = path.extname(resolved).toLowerCase();
   if (OUT_EXTENSIONS.includes(ext)) {
     return { kind: "file", path: resolved, dir: path.dirname(resolved) };
@@ -1407,7 +1436,7 @@ function parseBatchManifest(text, baseDir, exists = fs.existsSync) {
         fail(`at most ${MAX_REFERENCE_IMAGES} refs`);
       } else {
         for (const ref of item.refs) {
-          const abs = path.resolve(baseDir, ref);
+          const abs = resolveUserPath(baseDir, ref);
           if (!exists(abs)) {
             fail(`reference image not found: ${abs}`);
           }
@@ -1420,7 +1449,7 @@ function parseBatchManifest(text, baseDir, exists = fs.existsSync) {
       if (typeof item.edit !== "string" || !item.edit) {
         fail("edit must be an input image path");
       } else {
-        inputPath = path.resolve(baseDir, item.edit);
+        inputPath = resolveUserPath(baseDir, item.edit);
         if (!exists(inputPath)) {
           fail(`input image not found: ${inputPath}`);
         }
@@ -1432,7 +1461,7 @@ function parseBatchManifest(text, baseDir, exists = fs.existsSync) {
     return {
       kind: inputPath ? "edit" : "generate",
       prompt: typeof item.prompt === "string" ? item.prompt.trim() : "",
-      out: typeof item.out === "string" ? path.resolve(baseDir, item.out) : null,
+      out: typeof item.out === "string" ? resolveUserPath(baseDir, item.out) : null,
       referenceImagePaths,
       inputPath,
       size,
@@ -1456,7 +1485,7 @@ async function handleBatch(argv) {
       throw new Error("Usage: /codex-image:batch <manifest.json> [--mode m] [--effort e] [--model s] [--parallel N]");
     }
     settingsCheck = resolveRunSettings(options);
-    const manifestPath = path.resolve(process.cwd(), options.manifest);
+    const manifestPath = resolveUserPath(process.cwd(), options.manifest);
     if (!fs.existsSync(manifestPath)) {
       throw new Error(`Manifest not found: ${manifestPath}`);
     }
@@ -1857,6 +1886,7 @@ export {
   buildStatusReport,
   collectSkillResults,
   compareSemver,
+  expandHome,
   createJsonlStreamer,
   createEventState,
   extractPromptAddDirs,

@@ -16,6 +16,7 @@ import {
   buildSkillGenerateInstruction,
   collectSkillResults,
   compareSemver,
+  expandHome,
   extractPromptAddDirs,
   parseBatchArguments,
   parseBatchManifest,
@@ -969,6 +970,66 @@ setInterval(() => {}, 1000);
     for (const target of [pid, grandPid]) {
       assert.throws(() => process.kill(target, 0), /ESRCH/, `process ${target} must be dead`);
     }
+  } finally {
+    sb.cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Review round 3: quoting, home expansion, signals, cleanup, formats, attribution
+// ---------------------------------------------------------------------------
+
+test("an unterminated quote in a flag value, edit input or batch token is an error, not a literal folder", () => {
+  assert.throws(() => parseGenerateArguments('--out "unterminated a cat'), /Unterminated quote/);
+  assert.throws(() => parseGenerateArguments("--out='half a cat"), /Unterminated quote/);
+  assert.throws(() => parseEditArguments('"in put.png make it red'), /Unterminated quote/);
+  assert.throws(() => parseBatchArguments('"m f.json --parallel 2'), /Unterminated quote/);
+  // A prompt that merely starts with an apostrophe is still a prompt.
+  assert.equal(parseGenerateArguments("'tis a cat").prompt, "'tis a cat");
+  // A real argv keeps quote characters literally (the shell already handled quoting).
+  assert.equal(parseGenerateArguments(["--out", '"odd.png', "x"]).out, '"odd.png');
+});
+
+test("e2e an unterminated quoted --out exits 1 and creates nothing", async () => {
+  const sb = makeSandbox();
+  try {
+    const result = await runCliStdin(sb, ["generate", "--args-stdin"], '--out "unterminated a cat');
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /Unterminated quote/);
+    assert.deepEqual(fs.readdirSync(sb.dir).sort(), ["home"]);
+  } finally {
+    sb.cleanup();
+  }
+});
+
+test("a leading ~/ or bare ~ expands to the home dir for --out, refs, edit input and manifest paths", () => {
+  assert.equal(expandHome("~", "/h"), "/h");
+  assert.equal(expandHome("~/a/b.png", "/h"), path.join("/h", "a", "b.png"));
+  assert.equal(expandHome("~user/x.png", "/h"), "~user/x.png");
+  assert.equal(expandHome("a/~/b", "/h"), "a/~/b");
+  assert.equal(resolveOutTarget("~/x.png", "/somewhere").path, path.join(os.homedir(), "x.png"));
+  assert.equal(resolveOutTarget("~", "/somewhere").path, os.homedir());
+  const sb = makeSandbox();
+  try {
+    const jobs = parseBatchManifest(JSON.stringify([{ prompt: "p", out: "~/o.png" }]), sb.dir, () => true);
+    assert.equal(jobs[0].out, path.join(os.homedir(), "o.png"));
+  } finally {
+    sb.cleanup();
+  }
+});
+
+test("e2e --out ~/x.png and --ref ~/r.png resolve against HOME, no literal ./~ folder", { skip: process.platform === "win32" }, async () => {
+  const sb = makeSandbox();
+  try {
+    const fakeHome = path.join(sb.dir, "fakehome");
+    fs.mkdirSync(fakeHome);
+    fs.writeFileSync(path.join(fakeHome, "r.png"), "ref");
+    const work = path.join(sb.dir, "work");
+    fs.mkdirSync(work);
+    const result = await runCli({ ...sb, dir: work }, ["generate", "--out", "~/x.png", "--ref", "~/r.png", "p"], { HOME: fakeHome });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(savedPaths(result.stdout), [path.join(fakeHome, "x.png")]);
+    assert.ok(!fs.existsSync(path.join(work, "~")), "no literal ~ folder");
   } finally {
     sb.cleanup();
   }
