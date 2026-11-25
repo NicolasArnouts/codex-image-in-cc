@@ -53,7 +53,7 @@ Flags go before the prompt (for `edit`: before the input path). `--` ends flags;
 
 | Flag | Meaning |
 |---|---|
-| `--out <path>` | A file (`.png`, `.jpg`, `.jpeg`, `.webp`, any case) or otherwise a directory. Default: `./codex-images/<UTC-timestamp>-<n>.png` (edit: `...-edit-<n>.png`). Parent dirs are created. Several images into one file path become `<stem>-1`, `<stem>-2`. |
+| `--out <path>` | A file (`.png`, `.jpg`, `.jpeg`, any case; `.webp` and other extensions are rejected because sips cannot write them) or otherwise a directory (a path without an extension). Default: `./codex-images/<UTC-timestamp>-<n>.png` (edit: `...-edit-<n>.png`). Parent dirs are created. Several images into one file path become `<stem>-1`, `<stem>-2`. |
 | `--force` | Overwrite an existing `--out` file. Default: never overwrite; use `hero-v2.png`, `hero-v3.png`. |
 | `--size <W>x<H>` | Exact final size (max 8192): scale to cover, then center-crop. Needs macOS `sips`; otherwise a warning is printed and the file is kept as is. |
 | `--transparent` | Request a transparent background. |
@@ -62,7 +62,7 @@ Flags go before the prompt (for `edit`: before the input path). `--` ends flags;
 | `--effort <e>` | `low`, `medium`, `high`, `xhigh`, `max`, `ultra` (`CODEX_IMAGE_EFFORT`). Default low (direct) / medium (skill). `minimal` and `none` are rejected. |
 | `--model <slug>` | Model for the turn (`CODEX_IMAGE_MODEL`). Default: none, so Codex uses the account default. |
 
-Quote paths with spaces. The built-in tool has no size parameter (it returns for example 1254x1254), which is why `--size` is applied by the wrapper.
+Quote paths with spaces inside slash-command arguments (on the CLI the shell already keeps each argv element as one token). `--transparent` with a `.jpg` out warns, since JPEG drops alpha. The built-in tool has no size parameter (it returns for example 1254x1254), which is why `--size` is applied by the wrapper.
 
 ### Output
 

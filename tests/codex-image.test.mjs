@@ -14,6 +14,7 @@ import {
   buildGenerateInstruction,
   buildSkillEditInstruction,
   buildSkillGenerateInstruction,
+  collectSkillResults,
   compareSemver,
   extractPromptAddDirs,
   parseBatchArguments,
@@ -22,7 +23,10 @@ import {
   parseEditArguments,
   parseGenerateArguments,
   parseSavedLines,
+  createJsonlStreamer,
+  createEventState,
   planDestinations,
+  reserveFile,
   resolveCodex,
   resolveCodexHome,
   resolveOutTarget,
@@ -202,7 +206,9 @@ test("resolveCodexHome precedence: CODEX_IMAGE_HOME > ~/.codex-image > CODEX_HOM
 test("resolveOutTarget: image extension (any case) is a file, otherwise a directory, default ./codex-images", () => {
   assert.deepEqual(resolveOutTarget("a/hero.PNG", "/w"), { kind: "file", path: "/w/a/hero.PNG", dir: "/w/a" });
   assert.equal(resolveOutTarget("a/b.jpeg", "/w").kind, "file");
-  assert.equal(resolveOutTarget("a/b.webp", "/w").kind, "file");
+  assert.throws(() => resolveOutTarget("a/b.webp", "/w"), /webp/);
+  assert.throws(() => resolveOutTarget("a/b.gif", "/w"), /Unsupported --out extension "\.gif"/);
+  assert.throws(() => resolveOutTarget("a/b.tiff", "/w"), /Unsupported/);
   assert.deepEqual(resolveOutTarget("a/logos", "/w"), { kind: "dir", path: "/w/a/logos", dir: "/w/a/logos" });
   assert.deepEqual(resolveOutTarget(undefined, "/w"), { kind: "dir", path: "/w/codex-images", dir: "/w/codex-images" });
   assert.equal(resolveOutTarget("/abs/x.png", "/w").path, "/abs/x.png");
@@ -264,7 +270,9 @@ test("skill instructions keep the imagegen skill prefix and add the SAVED contra
   const fileTarget = { kind: "file", path: "/o/hero.png", dir: "/o" };
   const gen = buildSkillGenerateInstruction({ prompt: "p", referenceImagePaths: ["/r/a.png"], outTarget: fileTarget, transparent: true, size: { width: 8, height: 4 } });
   assert.match(gen, /^Use the imagegen skill\./);
-  assert.match(gen, /Save the final image\(s\) to \/o\/hero\.png \(create no other copies\)/);
+  assert.match(gen, /Save the final image to exactly \/o\/hero\.png \(an empty placeholder/);
+  assert.match(gen, /Never overwrite any other existing file/);
+  assert.match(gen, /\/o\/hero-2\.png/);
   assert.match(gen, /SAVED: <absolute path>/);
   assert.match(gen, /transparent background/);
   assert.match(gen, /8x4/);
@@ -272,7 +280,7 @@ test("skill instructions keep the imagegen skill prefix and add the SAVED contra
   const edit = buildSkillEditInstruction({ inputPath: "/i/x.png", prompt: "e", outTarget: { kind: "dir", path: "/o/d", dir: "/o/d" } });
   assert.match(edit, /^Use the imagegen skill\./);
   assert.match(edit, /\/i\/x\.png/);
-  assert.match(edit, /Save the final image\(s\) to \/o\/d /);
+  assert.match(edit, /Save the final image\(s\) into \/o\/d: the first as exactly \/o\/d\/<UTC-timestamp>-edit-1\.png/);
   assert.match(edit, /User edit request:\n\ne$/);
 });
 
@@ -405,7 +413,7 @@ test("parseBatchArguments parses manifest, flags, and bounds --parallel", () => 
 // ---------------------------------------------------------------------------
 
 function makeSandbox() {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-image-test-"));
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "codex-image-test-")));
   const home = path.join(dir, "home");
   fs.mkdirSync(home);
   return { dir, home, cleanup: () => fs.rmSync(dir, { recursive: true, force: true }) };
@@ -630,8 +638,8 @@ test("e2e --size 2x2 on macOS: INFO line reports 2x2; non-png out converts or wa
     const jpg = await runCli(sb, ["generate", "--out", path.join(sb.dir, "j.jpg"), "p"]);
     assert.equal(jpg.status, 0, jpg.stderr);
     const [saved] = savedPaths(jpg.stdout);
-    assert.match(saved, /\.(jpg|png)$/);
-    assert.ok(fs.existsSync(saved));
+    assert.equal(path.extname(saved), ".jpg");
+    assert.deepEqual([...fs.readFileSync(saved).subarray(0, 3)], [0xff, 0xd8, 0xff], "JPEG magic bytes");
   } finally {
     sb.cleanup();
   }
@@ -649,6 +657,318 @@ test("main guard runs through a symlink (bin install) and prints usage", { skip:
       child.on("close", () => resolve(stdout));
     });
     assert.match(output, /Usage: codex-image <command>/);
+  } finally {
+    sb.cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Review fixes: quoting, collisions, trust, tokenizer, process handling
+// ---------------------------------------------------------------------------
+
+function runCliStdin(sandbox, args, stdinText, extraEnv = {}) {
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, [SCRIPT, ...args], {
+      cwd: sandbox.dir,
+      env: {
+        ...process.env,
+        CODEX_IMAGE_CODEX_BIN: FAKE_CODEX,
+        CODEX_IMAGE_HOME: sandbox.home,
+        CODEX_IMAGE_MODE: "",
+        CODEX_IMAGE_EFFORT: "",
+        CODEX_IMAGE_MODEL: "",
+        ...extraEnv
+      },
+      stdio: ["pipe", "pipe", "pipe"]
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => (stdout += chunk));
+    child.stderr.on("data", (chunk) => (stderr += chunk));
+    child.on("close", (status) => resolve({ status, stdout, stderr }));
+    child.stdin.end(stdinText);
+  });
+}
+
+test("argv with several elements keeps one token per element (spaced --out, spaced ref, prompt joined)", () => {
+  const parsed = parseGenerateArguments(["--out", "/a b/x.png", "--ref", "/r s/ref.png", "a", "cat"]);
+  assert.equal(parsed.out, "/a b/x.png");
+  assert.deepEqual(parsed.referenceImages, ["/r s/ref.png"]);
+  assert.equal(parsed.prompt, "a cat");
+  const edit = parseEditArguments(["--out", "/o p/e.png", "/in put/photo.png", "make", "it", "red"]);
+  assert.equal(edit.input, "/in put/photo.png");
+  assert.equal(edit.prompt, "make it red");
+  assert.equal(parseGenerateArguments(["--", "--force", "x"]).prompt, "--force x");
+  assert.deepEqual(parseBatchArguments(["/m d/manifest.json", "--parallel", "2"]).manifest, "/m d/manifest.json");
+});
+
+test("tokenizer unescapes \\\" and \\' inside quotes and supports quoted inline values", () => {
+  assert.deepEqual(splitFirstToken('"a \\"b\\" c.png" rest'), { input: 'a "b" c.png', prompt: "rest" });
+  assert.deepEqual(splitFirstToken("'it\\'s.png' rest"), { input: "it's.png", prompt: "rest" });
+  const parsed = parseGenerateArguments('--ref="/a b.png" --out="/o p/x.png" prompt here');
+  assert.deepEqual(parsed.referenceImages, ["/a b.png"]);
+  assert.equal(parsed.out, "/o p/x.png");
+  assert.equal(parsed.prompt, "prompt here");
+});
+
+test("e2e real argv with a spaced --out saves to that exact path (argv.join used to split it)", async () => {
+  const sb = makeSandbox();
+  try {
+    const out = path.join(sb.dir, "a b", "x.png");
+    const result = await runCli(sb, ["generate", "--out", out, "a", "cat"]);
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(savedPaths(result.stdout), [out]);
+    assert.ok(!fs.existsSync(path.join(sb.dir, "a")), "no stray split directory");
+  } finally {
+    sb.cleanup();
+  }
+});
+
+test("e2e batch with a manifest in a spaced directory", async () => {
+  const sb = makeSandbox();
+  try {
+    const dir = path.join(sb.dir, "my manifests");
+    fs.mkdirSync(dir);
+    fs.writeFileSync(path.join(dir, "m f.json"), JSON.stringify([{ prompt: "one", out: "o u/one.png" }]));
+    const result = await runCli(sb, ["batch", path.join(dir, "m f.json")]);
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(savedPaths(result.stdout), [path.join(dir, "o u", "one.png")]);
+  } finally {
+    sb.cleanup();
+  }
+});
+
+test("e2e --args-stdin: $HOME, backticks and quotes in the prompt arrive literally; quoted spaced --out works", async () => {
+  const sb = makeSandbox();
+  try {
+    const promptFile = path.join(sb.dir, "prompt.txt");
+    const out = path.join(sb.dir, "sp ace", "y.png");
+    const text = `--out '${out}' a $HOME \`x\` "q" $(touch ${path.join(sb.dir, "pwned")})\n`;
+    const result = await runCliStdin(sb, ["generate", "--args-stdin"], text, { FAKE_CODEX_PROMPT_FILE: promptFile });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(savedPaths(result.stdout), [out]);
+    const received = fs.readFileSync(promptFile, "utf8");
+    assert.ok(received.endsWith(`Request:\n\na $HOME \`x\` "q" $(touch ${path.join(sb.dir, "pwned")})`), received);
+    assert.ok(!fs.existsSync(path.join(sb.dir, "pwned")));
+    const mixed = await runCliStdin(sb, ["generate", "--args-stdin", "extra"], "x");
+    assert.equal(mixed.status, 1);
+  } finally {
+    sb.cleanup();
+  }
+});
+
+test("reserveFile creates unique placeholders atomically (O_EXCL) and honors force", () => {
+  const sb = makeSandbox();
+  try {
+    const file = path.join(sb.dir, "n", "x.png");
+    const first = reserveFile(file);
+    const second = reserveFile(file);
+    const third = reserveFile(file);
+    assert.deepEqual([first, second, third], [file, path.join(sb.dir, "n", "x-v2.png"), path.join(sb.dir, "n", "x-v3.png")]);
+    assert.ok([first, second, third].every((f) => fs.existsSync(f)));
+    assert.equal(reserveFile(file, { force: true }), file);
+  } finally {
+    sb.cleanup();
+  }
+});
+
+test("e2e batch --parallel 2 with two items on the same out file yields two different files", async () => {
+  const sb = makeSandbox();
+  try {
+    fs.writeFileSync(path.join(sb.dir, "m.json"), JSON.stringify([{ prompt: "a", out: "same.png" }, { prompt: "b", out: "same.png" }]));
+    const result = await runCli(sb, ["batch", "m.json", "--parallel", "2"], { FAKE_CODEX_DELAY_MS: "300" });
+    assert.equal(result.status, 0, result.stderr);
+    const saved = savedPaths(result.stdout).sort();
+    assert.deepEqual(saved, [path.join(sb.dir, "same-v2.png"), path.join(sb.dir, "same.png")]);
+    assert.ok(saved.every((f) => fs.statSync(f).size > 0));
+  } finally {
+    sb.cleanup();
+  }
+});
+
+test("e2e batch --parallel 2 with two items on the same dir (and default dir) yields distinct files", async () => {
+  const sb = makeSandbox();
+  try {
+    fs.writeFileSync(path.join(sb.dir, "m.json"), JSON.stringify([{ prompt: "a", out: "d" }, { prompt: "b", out: "d" }, { prompt: "c" }, { prompt: "d" }]));
+    const result = await runCli(sb, ["batch", "m.json", "--parallel", "3"], { FAKE_CODEX_DELAY_MS: "300" });
+    assert.equal(result.status, 0, result.stderr);
+    const saved = savedPaths(result.stdout);
+    assert.equal(saved.length, 4);
+    assert.equal(new Set(saved).size, 4, "all SAVED paths distinct");
+    assert.ok(saved.every((f) => fs.statSync(f).size > 0));
+  } finally {
+    sb.cleanup();
+  }
+});
+
+test("e2e a failed item leaves no placeholder and removes a directory the wrapper created", async () => {
+  const sb = makeSandbox();
+  try {
+    const out = path.join(sb.dir, "fresh", "deeper");
+    const result = await runCli(sb, ["generate", "--out", out, "p"], { FAKE_CODEX_FAIL: "1" });
+    assert.equal(result.status, 1);
+    assert.ok(!fs.existsSync(path.join(sb.dir, "fresh")), "created dirs removed");
+    fs.mkdirSync(path.join(sb.dir, "keep"));
+    const file = path.join(sb.dir, "keep", "f.png");
+    await runCli(sb, ["generate", "--out", file, "p"], { FAKE_CODEX_FAIL: "1" });
+    assert.ok(!fs.existsSync(file), "empty placeholder removed");
+    assert.ok(fs.existsSync(path.join(sb.dir, "keep")), "pre-existing dir kept");
+  } finally {
+    sb.cleanup();
+  }
+});
+
+test("skill-mode trust: pre-existing files, files outside the out dir, empty files and non-images are rejected", () => {
+  const sb = makeSandbox();
+  try {
+    const outDir = path.join(sb.dir, "out");
+    fs.mkdirSync(outDir);
+    const old = path.join(outDir, "old.png");
+    fs.writeFileSync(old, "x");
+    const snapshot = new Set([old]);
+    const fresh = path.join(outDir, "fresh.png");
+    const empty = path.join(outDir, "empty.png");
+    const text = path.join(outDir, "notes.txt");
+    const outside = path.join(sb.dir, "outside.png");
+    const reserved = path.join(outDir, "res.png");
+    for (const f of [fresh, text, outside]) {
+      fs.writeFileSync(f, "data");
+    }
+    fs.writeFileSync(empty, "");
+    fs.writeFileSync(reserved, "data");
+    const got = collectSkillResults({
+      outDir,
+      reserved,
+      candidates: [old, fresh, empty, text, outside, "/etc/hosts.png", reserved, fresh],
+      snapshot: new Set([...snapshot, reserved]),
+      sinceMs: Date.now() - 1000
+    });
+    assert.deepEqual(got.sort(), [fresh, reserved].sort());
+  } finally {
+    sb.cleanup();
+  }
+});
+
+test("--out with an unsupported extension is rejected before spawning (.webp, .gif)", async () => {
+  const sb = makeSandbox();
+  try {
+    const log = path.join(sb.dir, "args.log");
+    for (const name of ["x.webp", "x.gif", "x.tiff"]) {
+      const result = await runCli(sb, ["generate", "--out", path.join(sb.dir, name), "p"], { FAKE_CODEX_LOG: log });
+      assert.equal(result.status, 1, name);
+      assert.match(result.stderr, /Unsupported --out extension/);
+    }
+    assert.ok(!fs.existsSync(log));
+    fs.writeFileSync(path.join(sb.dir, "m.json"), JSON.stringify([{ prompt: "x", out: "a.gif" }]));
+    const batch = await runCli(sb, ["batch", "m.json"], { FAKE_CODEX_LOG: log });
+    assert.equal(batch.status, 1);
+    assert.ok(!fs.existsSync(log));
+  } finally {
+    sb.cleanup();
+  }
+});
+
+test("--transparent with a .jpg out warns that alpha is dropped", async () => {
+  const sb = makeSandbox();
+  try {
+    const result = await runCli(sb, ["generate", "--transparent", "--out", path.join(sb.dir, "t.jpg"), "p"]);
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stderr, /warning: --transparent with a \.jpg\/\.jpeg out/);
+  } finally {
+    sb.cleanup();
+  }
+});
+
+test("missing thread id: only an unclaimed dir created after spawn is used; stale dirs are ignored", async () => {
+  const sb = makeSandbox();
+  try {
+    const stale = path.join(sb.home, "generated_images", "stale-thread");
+    fs.mkdirSync(stale, { recursive: true });
+    fs.writeFileSync(path.join(stale, "old.png"), "old");
+    const past = new Date(Date.now() - 3_600_000);
+    fs.utimesSync(stale, past, past);
+    fs.utimesSync(path.join(stale, "old.png"), past, past);
+    const out = path.join(sb.dir, "n.png");
+    const result = await runCli(sb, ["generate", "--out", out, "p"], { FAKE_CODEX_NO_THREAD: "1" });
+    assert.equal(result.status, 0, result.stderr);
+    assert.notEqual(fs.readFileSync(out, "utf8"), "old");
+    assert.ok(fs.readFileSync(out).subarray(1, 4).toString() === "PNG");
+  } finally {
+    sb.cleanup();
+  }
+});
+
+test("missing thread id in a parallel batch is ambiguous: items fail instead of stealing each other's images", async () => {
+  const sb = makeSandbox();
+  try {
+    fs.writeFileSync(path.join(sb.dir, "m.json"), JSON.stringify([{ prompt: "a", out: "a.png" }, { prompt: "b", out: "b.png" }]));
+    const result = await runCli(sb, ["batch", "m.json", "--parallel", "2"], { FAKE_CODEX_NO_THREAD: "1", FAKE_CODEX_DELAY_MS: "300" });
+    assert.equal(result.status, 1);
+    assert.match(result.stdout, /ITEM 1 failed .*unambiguously/);
+    assert.match(result.stdout, /ITEM 2 failed .*unambiguously/);
+    assert.ok(!fs.existsSync(path.join(sb.dir, "a.png")) && !fs.existsSync(path.join(sb.dir, "b.png")));
+  } finally {
+    sb.cleanup();
+  }
+});
+
+test("createJsonlStreamer reassembles a JSON line split across stdout chunks", () => {
+  const state = createEventState();
+  const progress = [];
+  const streamer = createJsonlStreamer(state, (m) => progress.push(m));
+  const line = '{"type":"thread.started","thread_id":"abc-123"}\n{"type":"item.completed","item":{"type":"agent_message","text":"hello"}}';
+  streamer.feed(line.slice(0, 20));
+  streamer.feed(line.slice(20, 70));
+  streamer.feed(`${line.slice(70)}\nnot json\n{"type":"turn.compl`);
+  streamer.feed('eted","usage":{"input_tokens":5,"cached_input_tokens":1,"output_tokens":2}}');
+  streamer.end();
+  assert.equal(state.threadId, "abc-123");
+  assert.deepEqual(state.messages, ["hello"]);
+  assert.deepEqual(state.usage, { input: 5, cached: 1, output: 2 });
+  assert.ok(progress.includes("thread abc-123 started"));
+});
+
+test("e2e the stdin trap: codex gets /dev/null as stdin (fake codex exits 3 if it is a pipe)", async () => {
+  const sb = makeSandbox();
+  try {
+    const result = await runCliStdin(sb, ["generate", "--out", path.join(sb.dir, "s.png"), "p"], "");
+    assert.equal(result.status, 0, result.stderr);
+  } finally {
+    sb.cleanup();
+  }
+});
+
+test("e2e timeout escalates to SIGKILL when codex ignores SIGTERM and kills its process group", { skip: process.platform === "win32" }, async () => {
+  const sb = makeSandbox();
+  try {
+    const stubborn = path.join(sb.dir, "stubborn-codex.mjs");
+    const pidFile = path.join(sb.dir, "pids.txt");
+    fs.writeFileSync(
+      stubborn,
+      `#!/usr/bin/env node
+import { spawn } from "node:child_process";
+import fs from "node:fs";
+process.on("SIGTERM", () => {});
+const grandchild = spawn(process.execPath, ["-e", "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"], { stdio: "ignore" });
+fs.writeFileSync(${JSON.stringify(pidFile)}, process.pid + " " + grandchild.pid);
+setInterval(() => {}, 1000);
+`
+    );
+    fs.chmodSync(stubborn, 0o755);
+    const started = Date.now();
+    const result = await runCli(sb, ["generate", "p"], {
+      CODEX_IMAGE_CODEX_BIN: stubborn,
+      CODEX_IMAGE_TIMEOUT_MS: "400",
+      CODEX_IMAGE_KILL_GRACE_MS: "300"
+    });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /timed out/);
+    assert.ok(Date.now() - started < 6000);
+    const [pid, grandPid] = fs.readFileSync(pidFile, "utf8").split(" ").map(Number);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    for (const target of [pid, grandPid]) {
+      assert.throws(() => process.kill(target, 0), /ESRCH/, `process ${target} must be dead`);
+    }
   } finally {
     sb.cleanup();
   }

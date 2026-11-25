@@ -53,9 +53,25 @@ function makePng(size = 4) {
   ]);
 }
 
+// stdin trap: the wrapper must hand codex a closed/empty stdin (/dev/null), never a pipe.
+const stdinStat = fs.fstatSync(0);
+if (stdinStat.isFIFO() || stdinStat.isSocket() || stdinStat.isFile()) {
+  console.error("fake codex: stdin is not /dev/null (stdin trap)");
+  process.exit(3);
+}
+if (process.env.FAKE_CODEX_PROMPT_FILE) {
+  fs.writeFileSync(process.env.FAKE_CODEX_PROMPT_FILE, args[args.length - 1]);
+}
+const delay = Number.parseInt(process.env.FAKE_CODEX_DELAY_MS ?? "0", 10);
+if (delay > 0) {
+  await new Promise((resolve) => setTimeout(resolve, delay));
+}
+
 const emit = (event) => console.log(JSON.stringify(event));
 const thread = crypto.randomUUID();
-emit({ type: "thread.started", thread_id: thread });
+if (process.env.FAKE_CODEX_NO_THREAD !== "1") {
+  emit({ type: "thread.started", thread_id: thread });
+}
 console.log("not json: ignored by the wrapper");
 emit({ type: "turn.started" });
 

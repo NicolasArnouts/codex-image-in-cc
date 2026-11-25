@@ -40,7 +40,7 @@ codex exec --json --sandbox workspace-write -c approval_policy="never" --skip-gi
 
    stdin is `ignore`. In skill mode, absolute image paths found in the prompt add `--add-dir` for their nearest existing ancestor.
 6. Parse stdout JSONL line by line (non-JSON ignored): `thread.started` (thread id), `item.completed` `agent_message` (progress), `item.completed` `error` (non-fatal warning, deduped), `turn.completed` (usage), `turn.failed` / `error` (failure). Progress goes to stderr; child stderr is drained and only its last 4000 chars are kept (printed on failure). A hard timeout (`CODEX_IMAGE_TIMEOUT_MS`, default 540000) sends SIGTERM, then SIGKILL after 5 s.
-7. Finalize (after the child exits): generated files = images in `<home>/generated_images/<thread_id>/` by mtime (without a thread id: files newer than the spawn). Skill mode first trusts files Codex saved itself (the out file, or `SAVED:` lines, modified after spawn) and otherwise falls back to the generated files. Direct mode copies to the planned destinations (png to jpg/webp via `sips -s format`, else warn and keep png), then `--size` (cover + center-crop via `sips`), then reads dimensions and alpha via `sips -g`.
+7. Finalize (after the child exits): generated files = images in `<home>/generated_images/<thread_id>/` by mtime (without a thread id: files newer than the spawn). Skill mode first trusts files Codex saved itself (the out file, or `SAVED:` lines, modified after spawn) and otherwise falls back to the generated files. Direct mode copies to the planned destinations (png to jpg/jpeg via `sips -s format jpeg`, else warn and keep png; webp is not writable by sips and is rejected), then `--size` (cover + center-crop via `sips`), then reads dimensions and alpha via `sips -g`.
 8. Print the stdout contract: `SAVED:`, `INFO:`, `USAGE:`. Exit 0 if at least one image was saved (a non-zero codex exit with images still saves them, with a warning), else 1.
 
 `batch` validates the whole manifest first, then runs one turn per item through the same `runImageJob` path with a worker pool (`--parallel` 1-3). Finalization is synchronous, so destination planning cannot race between items in one process.
@@ -59,11 +59,11 @@ When a slash command runs, Claude Code passes the SKILL.md template (with `$ARGU
 
 `codex exec` must be invoked with stdin ignored (`stdio: ["ignore","pipe","pipe"]`). Otherwise, in non-TTY contexts it treats piped stdin as an appendable `<stdin>` block and hangs waiting for EOF. This is not obvious from `codex exec --help`.
 
-### Quoted-arg passing through Bash → Node → Codex
+### Argument passing: argv vs a single string, and `--args-stdin`
 
-The SKILL.md bash is `node ... <subcommand> "$ARGUMENTS"`. Claude Code substitutes `$ARGUMENTS` into the bash text before bash parses it. The double quotes around `"$ARGUMENTS"` ensure bash treats the substituted text as one positional argument to Node, even if it contains spaces or shell metacharacters. Node receives it as a single string in `process.argv`. Codex receives the prompt as a single argv element from Node's `spawn` call (no shell re-interpretation).
+Two input shapes reach the parser. A real shell argv (the `codex-image` CLI) has one element per shell word, so each element is exactly one token and only the elements after the flags are joined with spaces into the prompt; quoting done by the shell survives (`--out "/a b/x.png"`). A single string (slash-command text or `--args-stdin`) is split by the quote-aware tokenizer (`splitFirstToken`: single or double quotes, `\"` and `\'` unescaped inside quotes, `--flag="a b"` inline values); the remainder after the flags stays raw text. A lone argv element that is an existing file is taken as the `batch` manifest path unchanged.
 
-`$(...)`, backticks, and `$X` in the user's prompt therefore reach Codex as literal text.
+Double quotes around `"$ARGUMENTS"` do NOT make the text safe: bash still expands `$`, backticks and `$(...)` inside double quotes, and a `"` inside the substituted text ends the quoted string early. The SKILL.md files therefore pass the arguments through a quoted heredoc (`<<'CODEX_IMAGE_ARGS'`, no expansion at all) to `--args-stdin`, which reads the raw string from the wrapper's own stdin. codex's stdin stays ignored.
 
 ### Sandbox mode, not `--full-auto` — and an explicit approval override
 
@@ -89,6 +89,10 @@ The Node script passes `--skip-git-repo-check` to `codex exec` because image gen
 - Unquoted first token (`photo.png make it red`) — first whitespace-separated word.
 
 The Node check `fs.existsSync(inputPath)` rejects bad paths early with a clear message before spawning `codex`.
+
+### File reservation and trust
+
+Before spawning, every job reserves a concrete unique primary file name by creating an empty placeholder with `O_EXCL` (`reserveFile`, next `-vN` on EEXIST), so parallel batch items can never target the same file; further images of one job reserve `-<n>` names the same way. Finals are staged in a temp file in the destination dir (convert, `--size`), then renamed onto the placeholder; nothing is ever `copyFileSync`-ed over a file the job did not reserve (except with `--force`). A job that ends with no image removes its empty placeholders and any directories it created. Skill mode is told the exact reserved name and "never overwrite"; it only trusts a result (out file or `SAVED:` line) that has an image extension, lies inside the out dir, is non-empty, is newer than the spawn, is unclaimed by another item, and either did not exist in the pre-spawn dir snapshot or is the reserved placeholder. The INFO `source=` is matched by content hash and omitted when unknown. Without a thread id only a single unclaimed thread dir created after the spawn is used, and never while another job is running.
 
 ### Direct mode vs skill mode
 

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn, spawnSync } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -19,7 +20,10 @@ const MAX_BATCH_PARALLEL = 3;
 const DEFAULT_TIMEOUT_MS = 540_000;
 const STDERR_TAIL_CHARS = 4000;
 
+// Extensions of images codex may leave under generated_images/.
 const IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".webp"];
+// Extensions we can WRITE. macOS sips cannot encode webp ("Can't write format").
+const OUT_EXTENSIONS = [".png", ".jpg", ".jpeg"];
 const MODES = ["direct", "skill"];
 // minimal / none hard-400 on the image turn, so they are not accepted.
 const VALID_EFFORTS = ["low", "medium", "high", "xhigh", "max", "ultra"];
@@ -167,6 +171,12 @@ function resolveRunSettings(options = {}, env = process.env) {
 // Argument parsing
 // ---------------------------------------------------------------------------
 
+// Split the first (optionally quoted) token off a raw argument string. Inside quotes,
+// \" and \' are unescaped. `--flag="quoted value"` yields `--flag=quoted value`.
+function unescapeQuotes(text) {
+  return text.replace(/\\(["'])/g, "$1");
+}
+
 function splitFirstToken(raw) {
   const text = String(raw ?? "").trim();
   if (!text) {
@@ -174,13 +184,48 @@ function splitFirstToken(raw) {
   }
   const quoted = text.match(/^(['"])((?:\\.|(?!\1).)+)\1(?:\s+([\s\S]+))?$/);
   if (quoted) {
-    return { input: quoted[2], prompt: (quoted[3] ?? "").trim() };
+    return { input: unescapeQuotes(quoted[2]), prompt: (quoted[3] ?? "").trim() };
+  }
+  const inlineQuoted = text.match(/^(--[\w-]+)=(['"])((?:\\.|(?!\2).)+)\2(?:\s+([\s\S]+))?$/);
+  if (inlineQuoted) {
+    return { input: `${inlineQuoted[1]}=${unescapeQuotes(inlineQuoted[3])}`, prompt: (inlineQuoted[4] ?? "").trim() };
   }
   const unquoted = text.match(/^(\S+)(?:\s+([\s\S]+))?$/);
   if (unquoted) {
     return { input: unquoted[1], prompt: (unquoted[2] ?? "").trim() };
   }
   return { input: null, prompt: null };
+}
+
+// Argument source. A single string (slash-command text, --args-stdin) is split with
+// splitFirstToken and the remainder stays raw text. An array (a real shell argv) treats
+// every element as exactly one token, so quoting done by the shell survives; the
+// remaining elements joined with spaces form the prompt.
+function makeSource(input) {
+  if (Array.isArray(input) && input.length !== 1) {
+    let index = 0;
+    return {
+      peek: () => (index < input.length ? String(input[index]) : null),
+      take: () => (index < input.length ? String(input[index++]) : null),
+      skipTerminator: () => {
+        index += 1;
+      },
+      rest: () => input.slice(index).join(" ").trim()
+    };
+  }
+  let rest = String((Array.isArray(input) ? input[0] : input) ?? "").trim();
+  return {
+    peek: () => splitFirstToken(rest).input,
+    take: () => {
+      const first = splitFirstToken(rest);
+      rest = first.prompt ?? "";
+      return first.input;
+    },
+    skipTerminator: () => {
+      rest = splitFirstToken(rest).prompt ?? "";
+    },
+    rest: () => rest.trim()
+  };
 }
 
 const REFERENCE_IMAGE_FLAGS = new Set(["--ref", "--reference", "--image"]);
@@ -190,8 +235,8 @@ const BOOLEAN_FLAGS = new Set(["--transparent", "--force"]);
 // Parse leading flags off `raw`. `kind` is "generate" (reference flags allowed) or
 // "edit". Stops at the first non-flag token (an unknown `--xyz` starts the prompt) or
 // at `--`. Returns { options, rest } where rest is the unparsed remainder.
-function parseLeadingFlags(raw, kind) {
-  let rest = String(raw ?? "").trim();
+function parseLeadingFlags(input, kind) {
+  const source = makeSource(input);
   const options = {
     referenceImages: [],
     out: null,
@@ -203,14 +248,13 @@ function parseLeadingFlags(raw, kind) {
     force: false
   };
 
-  while (rest) {
-    const first = splitFirstToken(rest);
-    const token = first.input;
+  for (;;) {
+    const token = source.peek();
     if (!token) {
       break;
     }
     if (token === "--") {
-      rest = first.prompt ?? "";
+      source.skipTerminator();
       break;
     }
     let name = token;
@@ -223,27 +267,24 @@ function parseLeadingFlags(raw, kind) {
     const isReference = kind === "generate" && REFERENCE_IMAGE_FLAGS.has(name);
 
     if (BOOLEAN_FLAGS.has(name) && inlineValue === null) {
+      source.take();
       if (name === "--transparent") {
         options.transparent = true;
       } else {
         options.force = true;
       }
-      rest = first.prompt ?? "";
       continue;
     }
 
     if (isReference || VALUE_FLAGS.has(name)) {
-      let value;
-      let after;
-      if (inlineValue !== null) {
-        value = inlineValue;
-        after = first.prompt ?? "";
-      } else {
-        const next = splitFirstToken(first.prompt ?? "");
-        value = next.input;
-        after = next.prompt ?? "";
+      source.take();
+      let value = inlineValue;
+      if (value === null) {
+        value = source.peek();
         if (value && value.startsWith("--")) {
           value = null;
+        } else if (value) {
+          source.take();
         }
       }
       if (!value) {
@@ -262,7 +303,6 @@ function parseLeadingFlags(raw, kind) {
       } else if (name === "--model") {
         options.model = value;
       }
-      rest = after;
       continue;
     }
 
@@ -274,7 +314,7 @@ function parseLeadingFlags(raw, kind) {
       `Too many reference images (${options.referenceImages.length}). The built-in image generation tool accepts at most ${MAX_REFERENCE_IMAGES} per request — pass the ${MAX_REFERENCE_IMAGES} most relevant.`
     );
   }
-  return { options, rest: rest.trim() };
+  return { options, source, rest: source.rest() };
 }
 
 function parseGenerateArguments(raw) {
@@ -284,28 +324,30 @@ function parseGenerateArguments(raw) {
 
 // edit [flags] <input> <prompt>
 function parseEditArguments(raw) {
-  const { options, rest } = parseLeadingFlags(raw, "edit");
-  const { input, prompt } = splitFirstToken(rest);
-  return { ...options, input: input ?? null, prompt: prompt ?? "" };
+  const { options, source } = parseLeadingFlags(raw, "edit");
+  const input = source.take();
+  return { ...options, input: input ?? null, prompt: source.rest() };
 }
 
-// Split a raw argument string into tokens (quotes supported) for `batch`.
-function tokenize(raw) {
+// Tokens for `batch`: a real argv (more than one element) is used as is, a single
+// string is split with the quote-aware tokenizer.
+function tokenize(input) {
+  if (Array.isArray(input) && input.length !== 1) {
+    return input.map(String);
+  }
   const tokens = [];
-  let rest = String(raw ?? "").trim();
-  while (rest) {
-    const { input, prompt } = splitFirstToken(rest);
-    if (!input) {
-      break;
-    }
-    tokens.push(input);
-    rest = prompt ?? "";
+  const source = makeSource(input);
+  for (let token = source.take(); token; token = source.take()) {
+    tokens.push(token);
   }
   return tokens;
 }
 
 function parseBatchArguments(raw) {
-  const tokens = tokenize(raw);
+  // A lone argv element that is an existing file is the manifest path as is (it may
+  // contain spaces); any other lone string is split by the quote-aware tokenizer.
+  const lone = Array.isArray(raw) && raw.length === 1 && fs.existsSync(path.resolve(String(raw[0])));
+  const tokens = lone ? [String(raw[0])] : tokenize(raw);
   const options = { manifest: null, mode: null, effort: null, model: null, parallel: 1 };
   for (let index = 0; index < tokens.length; index += 1) {
     let name = tokens[index];
@@ -368,15 +410,22 @@ function hasImageExtension(file) {
   return IMAGE_EXTENSIONS.includes(path.extname(String(file)).toLowerCase());
 }
 
-// `--out` ending in an image extension is a file; anything else is a directory.
-// Omitted: <cwd>/codex-images/.
+// `--out` ending in .png/.jpg/.jpeg (any case) is a file. A last segment with any other
+// dot-extension (.gif, .tiff, .webp ...) is an error, not a directory. Otherwise it is a
+// directory. Omitted: <cwd>/codex-images/.
 function resolveOutTarget(out, cwd) {
   if (!out) {
     return { kind: "dir", path: path.resolve(cwd, "codex-images"), dir: path.resolve(cwd, "codex-images") };
   }
   const resolved = path.resolve(cwd, out);
-  if (hasImageExtension(resolved)) {
+  const ext = path.extname(resolved).toLowerCase();
+  if (OUT_EXTENSIONS.includes(ext)) {
     return { kind: "file", path: resolved, dir: path.dirname(resolved) };
+  }
+  if (ext) {
+    const hint =
+      ext === ".webp" ? " (macOS sips cannot write webp)" : "";
+    throw new Error(`Unsupported --out extension "${ext}"${hint}; use ${OUT_EXTENSIONS.join(", ")} for a file, or a directory path without an extension.`);
   }
   return { kind: "dir", path: resolved, dir: resolved };
 }
@@ -396,7 +445,35 @@ function versionedPath(file, exists = fs.existsSync) {
   }
 }
 
-// Destination files for `count` images. Never overwrites unless force.
+// Atomically reserve a unique file name: create an empty placeholder with O_EXCL and move
+// to the next -vN on EEXIST. The caller owns the placeholder and must either rename an
+// image onto it or remove it. With force the exact path is returned without a placeholder.
+function reserveFile(file, { force = false } = {}) {
+  if (force) {
+    return file;
+  }
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const ext = path.extname(file);
+  const stem = file.slice(0, file.length - ext.length);
+  for (let version = 1; ; version += 1) {
+    const candidate = version === 1 ? file : `${stem}-v${version}${ext}`;
+    try {
+      fs.closeSync(fs.openSync(candidate, "wx"));
+      return candidate;
+    } catch (error) {
+      if (error.code !== "EEXIST") {
+        throw error;
+      }
+    }
+  }
+}
+
+function dirNamePrefix(timestamp, edit) {
+  return `${timestamp}-${edit ? "edit-" : ""}`;
+}
+
+// Destination files for `count` images (pure; used for planning and tests). Never
+// overwrites unless force.
 function planDestinations({ target, count, edit = false, timestamp = timestampForFile(), force = false, exists = fs.existsSync }) {
   const pick = (file) => (force ? file : versionedPath(file, exists));
   const destinations = [];
@@ -412,9 +489,8 @@ function planDestinations({ target, count, edit = false, timestamp = timestampFo
     return destinations;
   }
   for (let index = 1; index <= count; index += 1) {
-    const name = `${timestamp}-${edit ? "edit-" : ""}${index}.png`;
     // Directory defaults are always versioned (a same-second rerun must not overwrite).
-    destinations.push(versionedPath(path.join(target.path, name), exists));
+    destinations.push(versionedPath(path.join(target.path, `${dirNamePrefix(timestamp, edit)}${index}.png`), exists));
   }
   return destinations;
 }
@@ -478,12 +554,21 @@ function formatReferenceImages(referenceImagePaths) {
   return `\nReference images for generation (also attached to this turn via codex exec --image):\n${lines.join("\n")}\n\nThese are generation references, not edit targets. If your built-in image generation tool accepts local image paths (codex 0.144+, referenced_image_paths), pass the absolute paths above so the reference pixels condition the output directly; otherwise use the attachments as visual context for style, identity, composition, mood, or subject guidance according to the user's prompt. Do not modify or overwrite the referenced files.\n`;
 }
 
+// outTarget.reserved is the concrete, already reserved (empty placeholder) file name.
 function skillSaveParagraph(outTarget, edit) {
-  const where =
-    outTarget.kind === "file"
-      ? outTarget.path
-      : `${outTarget.path} (name files <UTC-timestamp>-${edit ? "edit-" : ""}<n>.png, n=1,2,... per image)`;
-  return `Save the final image(s) to ${where} (create no other copies).\n\nFor each saved image, print exactly one line:\nSAVED: <absolute path>`;
+  const first = outTarget.reserved ?? (outTarget.kind === "file" ? outTarget.path : path.join(outTarget.path, `${outTarget.prefix ?? dirNamePrefix("<UTC-timestamp>", edit)}1.png`));
+  const note = outTarget.force
+    ? "overwrite it"
+    : "an empty placeholder was created there for you: replace it";
+  let where;
+  if (outTarget.kind === "file") {
+    const ext = path.extname(first);
+    const stem = first.slice(0, first.length - ext.length);
+    where = `Save the final image to exactly ${first} (${note}). If you produce several images, save the others next to it as ${stem}-2${ext}, ${stem}-3${ext}, ...`;
+  } else {
+    where = `Save the final image(s) into ${outTarget.path}: the first as exactly ${first} (${note}), further ones as ${outTarget.path}/${outTarget.prefix ?? dirNamePrefix("<UTC-timestamp>", edit)}<n>.png (n=2,3,...)`;
+  }
+  return `${where}\nNever overwrite any other existing file, and create no other copies.\n\nFor each saved image, print exactly one line:\nSAVED: <absolute path>`;
 }
 
 function skillHints({ transparent, size }) {
@@ -645,60 +730,122 @@ function timeoutMs(env = process.env) {
   return Number.isFinite(value) && value > 0 ? value : DEFAULT_TIMEOUT_MS;
 }
 
+function killGraceMs(env = process.env) {
+  const value = Number.parseInt(env.CODEX_IMAGE_KILL_GRACE_MS ?? "", 10);
+  return Number.isFinite(value) && value > 0 ? value : 5000;
+}
+
+// Line-buffered JSONL reader: a JSON line may be split across stdout chunks.
+function createJsonlStreamer(state, emit) {
+  let carry = "";
+  const handle = (line) => {
+    for (const message of applyCodexEvent(state, parseJsonLine(line))) {
+      emit(message);
+    }
+  };
+  return {
+    feed(chunk) {
+      const lines = (carry + chunk).split("\n");
+      carry = lines.pop();
+      lines.forEach(handle);
+    },
+    end() {
+      handle(carry);
+      carry = "";
+    }
+  };
+}
+
 // Run one codex turn. stdin is ignored (the stdin trap), stdout is parsed as JSONL,
-// stderr is drained into a bounded tail. Resolves { status, timedOut, state, stderrTail }.
+// stderr is drained into a bounded tail. The child runs in its own process group
+// (non-Windows) so a timeout kills codex and everything it spawned.
+// Resolves { status, timedOut, state, stderrTail }.
 function runCodexTurn({ args, cwd, home, label = "", onProgress }) {
   return new Promise((resolve, reject) => {
     const codex = getCodex();
     const state = createEventState();
     const prefix = label ? `codex-image: [${label}] ` : "codex-image: ";
     const emit = onProgress ?? ((message) => process.stderr.write(`${prefix}${message}\n`));
+    const streamer = createJsonlStreamer(state, emit);
     let stderrTail = "";
-    let carry = "";
     let timedOut = false;
     let killTimer = null;
+    let exitTimer = null;
+    let settled = false;
+    const useGroup = process.platform !== "win32";
 
     const child = spawn(codex.command, [...codex.prefix, ...args], {
       cwd,
       env: { ...process.env, CODEX_HOME: home },
       stdio: ["ignore", "pipe", "pipe"],
+      detached: useGroup,
       windowsHide: true
     });
-    child.stdout.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => {
-      const lines = (carry + chunk).split("\n");
-      carry = lines.pop();
-      for (const line of lines) {
-        for (const message of applyCodexEvent(state, parseJsonLine(line))) {
-          emit(message);
+    const signalChild = (signal) => {
+      try {
+        if (useGroup && child.pid) {
+          process.kill(-child.pid, signal);
+        } else {
+          child.kill(signal);
+        }
+      } catch {
+        try {
+          child.kill(signal);
+        } catch {
+          // already gone
         }
       }
-    });
+    };
+    // If this wrapper itself exits, do not leave an orphaned codex group behind.
+    const onParentExit = () => signalChild("SIGTERM");
+    process.once("exit", onParentExit);
+
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => streamer.feed(chunk));
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", (chunk) => {
       stderrTail = (stderrTail + chunk).slice(-STDERR_TAIL_CHARS);
     });
 
     const limit = timeoutMs();
+    const grace = killGraceMs();
     const timer = setTimeout(() => {
       timedOut = true;
-      child.kill("SIGTERM");
-      killTimer = setTimeout(() => child.kill("SIGKILL"), 5000);
+      signalChild("SIGTERM");
+      killTimer = setTimeout(() => signalChild("SIGKILL"), grace);
     }, limit);
 
-    child.on("error", (error) => {
+    const finish = (status, signal) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
       clearTimeout(timer);
       clearTimeout(killTimer);
+      clearTimeout(exitTimer);
+      process.removeListener("exit", onParentExit);
+      streamer.end();
+      child.stdout.destroy();
+      child.stderr.destroy();
+      resolve({ status: status ?? (signal ? 1 : 0), timedOut, timeoutMs: limit, state, stderrTail });
+    };
+
+    child.on("error", (error) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      clearTimeout(killTimer);
+      clearTimeout(exitTimer);
+      process.removeListener("exit", onParentExit);
       reject(error);
     });
-    child.on("close", (status, signal) => {
-      clearTimeout(timer);
-      clearTimeout(killTimer);
-      for (const message of applyCodexEvent(state, parseJsonLine(carry))) {
-        emit(message);
-      }
-      resolve({ status: status ?? (signal ? 1 : 0), timedOut, timeoutMs: limit, state, stderrTail });
+    // 'close' waits for the pipes; a grandchild holding them open must not hang us.
+    child.on("exit", (status, signal) => {
+      exitTimer = setTimeout(() => finish(status, signal), 2000);
     });
+    child.on("close", (status, signal) => finish(status, signal));
   });
 }
 
@@ -757,9 +904,7 @@ function applySize(file, size) {
 }
 
 function convertImage(source, destination) {
-  const ext = path.extname(destination).toLowerCase();
-  const format = ext === ".webp" ? "webp" : "jpeg";
-  const result = spawnSync("sips", ["-s", "format", format, source, "--out", destination], { stdio: "pipe" });
+  const result = spawnSync("sips", ["-s", "format", "jpeg", source, "--out", destination], { stdio: "pipe" });
   return result.status === 0 && fs.existsSync(destination);
 }
 
@@ -784,25 +929,51 @@ function listImagesIn(dir) {
   return files;
 }
 
-// Files codex generated for this turn, oldest first.
+// Process-wide bookkeeping so concurrent batch items never claim each other's output.
+const claimedThreads = new Set();
+const claimedPaths = new Set();
+let activeJobs = 0;
+
+function sortedPaths(files) {
+  return files.sort((a, b) => a.mtimeMs - b.mtimeMs || a.path.localeCompare(b.path)).map((file) => file.path);
+}
+
+// Thread dirs under generated_images created after `sinceMs` that nobody claimed.
+function findNewThreadDirs(home, sinceMs) {
+  const root = path.join(home, "generated_images");
+  let dirs = [];
+  try {
+    dirs = fs.readdirSync(root, { withFileTypes: true }).filter((entry) => entry.isDirectory());
+  } catch {
+    return [];
+  }
+  return dirs
+    .map((entry) => ({ name: entry.name, stat: fs.statSync(path.join(root, entry.name)) }))
+    .filter(({ name, stat }) => !claimedThreads.has(name) && (stat.birthtimeMs > 0 ? stat.birthtimeMs : stat.ctimeMs) >= sinceMs)
+    .map(({ name }) => name);
+}
+
+// Files codex generated for this turn, oldest first. Known thread id: that thread's dir.
+// Missing thread id: only a single, unclaimed thread dir created after the spawn, and
+// never while another job is running (ambiguous) -> { error }.
 function collectGeneratedImages(home, threadId, sinceMs) {
   const root = path.join(home, "generated_images");
-  let files;
-  if (threadId) {
-    files = listImagesIn(path.join(root, threadId));
-  } else {
-    files = [];
-    let dirs = [];
-    try {
-      dirs = fs.readdirSync(root, { withFileTypes: true }).filter((entry) => entry.isDirectory());
-    } catch {
-      dirs = [];
+  let id = threadId;
+  if (!id) {
+    const candidates = findNewThreadDirs(home, sinceMs);
+    if (candidates.length > 0 && (candidates.length > 1 || activeJobs > 1)) {
+      return {
+        files: [],
+        error: "codex reported no thread id and the generated images cannot be attributed to this item unambiguously; not saving them"
+      };
     }
-    for (const dir of dirs) {
-      files.push(...listImagesIn(path.join(root, dir.name)).filter((file) => file.mtimeMs >= sinceMs));
-    }
+    id = candidates[0] ?? null;
   }
-  return files.sort((a, b) => a.mtimeMs - b.mtimeMs || a.path.localeCompare(b.path)).map((file) => file.path);
+  if (!id) {
+    return { files: [], error: null };
+  }
+  claimedThreads.add(id);
+  return { files: sortedPaths(listImagesIn(path.join(root, id))), error: null };
 }
 
 function parseSavedLines(text) {
@@ -813,50 +984,121 @@ function parseSavedLines(text) {
   return paths;
 }
 
-// Skill-mode results: files the Codex turn itself saved (out file, or SAVED: lines),
-// only if modified after the turn started.
-function collectSkillResults({ outTarget, plannedOut, lastText, sinceMs }) {
-  const fresh = (file) => {
-    try {
-      return fs.statSync(file).mtimeMs >= sinceMs - 2000;
-    } catch {
-      return false;
-    }
-  };
-  const results = [];
-  if (outTarget.kind === "file" && fresh(plannedOut)) {
-    results.push(plannedOut);
+function topLevelSnapshot(dir) {
+  try {
+    return new Set(fs.readdirSync(dir).map((name) => path.join(dir, name)));
+  } catch {
+    return new Set();
   }
-  for (const saved of parseSavedLines(lastText)) {
-    const abs = path.resolve(saved);
-    if (!results.includes(abs) && fresh(abs)) {
-      results.push(abs);
+}
+
+// Skill-mode results: only files that have an image extension, sit inside the planned
+// out dir, are non-empty, were modified after the spawn, were not claimed already, and
+// either did not exist before the spawn or are the reserved placeholder we handed out.
+function collectSkillResults({ outDir, reserved, candidates, snapshot, sinceMs }) {
+  const results = [];
+  for (const candidate of candidates) {
+    const abs = path.resolve(candidate);
+    if (results.includes(abs) || claimedPaths.has(abs) || !hasImageExtension(abs)) {
+      continue;
     }
+    if (!abs.startsWith(outDir + path.sep)) {
+      continue;
+    }
+    let stat;
+    try {
+      stat = fs.statSync(abs);
+    } catch {
+      continue;
+    }
+    if (!stat.isFile() || stat.size === 0 || stat.mtimeMs < sinceMs - 2000) {
+      continue;
+    }
+    if (abs !== reserved && snapshot.has(abs)) {
+      continue;
+    }
+    results.push(abs);
   }
   return results;
 }
 
-// Copy generated files to their destinations (mkdir -p, optional format conversion).
-function copyGenerated({ generated, destinations, warnings }) {
-  const finals = [];
-  generated.forEach((source, index) => {
-    let destination = destinations[index];
-    fs.mkdirSync(path.dirname(destination), { recursive: true });
-    const ext = path.extname(destination).toLowerCase();
-    const sourceIsPng = path.extname(source).toLowerCase() === ".png";
-    if (ext !== ".png" && sourceIsPng) {
-      if (hasSips() && convertImage(source, destination)) {
-        finals.push({ path: destination, source });
-        return;
-      }
-      const fallback = versionedPath(`${destination.slice(0, destination.length - ext.length)}.png`);
-      warnings.push(`could not convert to ${ext}; kept png at ${fallback}`);
-      destination = fallback;
+function sha256(file) {
+  return crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+}
+
+// Content match between a final file and the generated candidates; null when unknown.
+function matchSource(file, generated) {
+  try {
+    const size = fs.statSync(file).size;
+    const hash = sha256(file);
+    return generated.find((candidate) => fs.statSync(candidate).size === size && sha256(candidate) === hash) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function removeIfEmpty(file) {
+  try {
+    if (fs.statSync(file).size === 0) {
+      fs.unlinkSync(file);
     }
-    fs.copyFileSync(source, destination);
-    finals.push({ path: destination, source });
-  });
-  return finals;
+  } catch {
+    // already gone
+  }
+}
+
+// Remove directories this run created, innermost first, only while empty.
+function removeCreatedDirs(root, leaf) {
+  if (!root) {
+    return;
+  }
+  for (let dir = leaf; dir.startsWith(root); dir = path.dirname(dir)) {
+    try {
+      fs.rmdirSync(dir);
+    } catch {
+      return;
+    }
+    if (dir === root) {
+      return;
+    }
+  }
+}
+
+// Write `source` to `destination` atomically: stage in a temp file inside the destination
+// dir (convert / resize there), then rename onto the placeholder we reserved. Never writes
+// into a file we did not reserve (except with an explicit --force).
+function materialize({ source, destination, size, force, warnings }) {
+  const dir = path.dirname(destination);
+  const temp = path.join(dir, `.codex-image-${process.pid}-${crypto.randomBytes(4).toString("hex")}-${path.basename(destination)}`);
+  let finalPath = destination;
+  const ext = path.extname(destination).toLowerCase();
+  const sourceIsPng = path.extname(source).toLowerCase() === ".png";
+  try {
+    if (ext !== ".png" && sourceIsPng) {
+      if (!(hasSips() && convertImage(source, temp))) {
+        const pngPath = `${destination.slice(0, destination.length - ext.length)}.png`;
+        warnings.push(`could not convert to ${ext}; kept png at ${pngPath}`);
+        removeIfEmpty(destination);
+        finalPath = reserveFile(pngPath, { force });
+        fs.copyFileSync(source, temp);
+      }
+    } else {
+      fs.copyFileSync(source, temp);
+    }
+    if (size) {
+      if (hasSips()) {
+        if (!applySize(temp, size)) {
+          warnings.push(`size not applied to ${finalPath} (sips failed)`);
+        }
+      } else {
+        warnings.push("size not applied (sips not available)");
+      }
+    }
+    fs.renameSync(temp, finalPath);
+  } finally {
+    fs.rmSync(temp, { force: true });
+  }
+  return finalPath;
 }
 
 // ---------------------------------------------------------------------------
@@ -866,20 +1108,43 @@ function copyGenerated({ generated, destinations, warnings }) {
 // job: { kind: "generate"|"edit", prompt, referenceImagePaths, inputPath, out, size,
 //        transparent, mode, effort, model, force, cwd, label }
 // Returns { ok, reason, stderrTail, lines: [stdout lines], saved, usageLine, warnings }.
-async function runImageJob(job, { onProgress } = {}) {
+async function runImageJob(job, options = {}) {
+  activeJobs += 1;
+  try {
+    return await runImageJobInner(job, options);
+  } catch (error) {
+    return { ok: false, reason: error.message, stderrTail: "", lines: [], saved: [], warnings: [] };
+  } finally {
+    activeJobs -= 1;
+  }
+}
+
+async function runImageJobInner(job, { onProgress } = {}) {
   const cwd = job.cwd ?? process.cwd();
   const settings = resolveRunSettings(job);
   const home = resolveCodexHome().path;
   const edit = job.kind === "edit";
+  const force = Boolean(job.force);
   const outTarget = resolveOutTarget(job.out, cwd);
-  fs.mkdirSync(outTarget.dir, { recursive: true });
   const warnings = [];
-
-  let plannedOut = outTarget.path;
-  if (settings.mode === "skill" && outTarget.kind === "file" && !job.force) {
-    plannedOut = versionedPath(outTarget.path);
+  if (job.transparent && outTarget.kind === "file" && [".jpg", ".jpeg"].includes(path.extname(outTarget.path).toLowerCase())) {
+    warnings.push("--transparent with a .jpg/.jpeg out: JPEG has no alpha channel, transparency is dropped");
   }
-  const skillTarget = { ...outTarget, path: plannedOut };
+
+  // Reserve a concrete, unique primary file name before anything is spawned.
+  const createdRoot = fs.mkdirSync(outTarget.dir, { recursive: true });
+  const prefix = dirNamePrefix(timestampForFile(), edit);
+  const primary = outTarget.kind === "file" ? outTarget.path : path.join(outTarget.path, `${prefix}1.png`);
+  const reserved = reserveFile(primary, { force });
+  const placeholders = force ? [] : [reserved];
+  const discard = () => {
+    for (const file of placeholders) {
+      removeIfEmpty(file);
+    }
+    removeCreatedDirs(createdRoot, outTarget.dir);
+  };
+
+  const skillTarget = { ...outTarget, reserved, prefix, force };
   const common = { prompt: job.prompt, transparent: Boolean(job.transparent), size: job.size ?? null };
   const instruction = edit
     ? buildEditInstruction({ mode: settings.mode, inputPath: job.inputPath, outTarget: skillTarget, ...common })
@@ -907,12 +1172,14 @@ async function runImageJob(job, { onProgress } = {}) {
     instruction
   });
 
+  const snapshot = topLevelSnapshot(outTarget.dir);
   const startMs = Date.now();
   let turn;
   try {
     turn = await runCodexTurn({ args, cwd, home, label: job.label, onProgress });
   } catch (error) {
     fs.rmSync(tmpDir, { recursive: true, force: true });
+    discard();
     return { ok: false, reason: `could not run codex: ${error.message}`, stderrTail: "", lines: [], saved: [], warnings };
   }
   let lastText = turn.state.messages.join("\n");
@@ -923,23 +1190,46 @@ async function runImageJob(job, { onProgress } = {}) {
   }
   fs.rmSync(tmpDir, { recursive: true, force: true });
 
-  const generated = collectGeneratedImages(home, turn.state.threadId, startMs - 2000);
+  const { files: generated, error: attribution } = collectGeneratedImages(home, turn.state.threadId, startMs - 2000);
+  if (attribution) {
+    discard();
+    return { ok: false, reason: attribution, stderrTail: turn.stderrTail, lines: [], saved: [], warnings };
+  }
+
   let finals = [];
   if (settings.mode === "skill") {
-    const results = collectSkillResults({ outTarget, plannedOut, lastText, sinceMs: startMs });
-    finals = results.map((file, index) => ({ path: file, source: generated[index] ?? "unknown" }));
+    const results = collectSkillResults({
+      outDir: outTarget.dir,
+      reserved,
+      candidates: [reserved, ...parseSavedLines(lastText)],
+      snapshot,
+      sinceMs: startMs
+    });
+    finals = results.map((file) => ({ path: file, source: matchSource(file, generated), inPlace: true }));
+    if (finals.length > 0 && !results.includes(reserved)) {
+      removeIfEmpty(reserved);
+    }
   }
   if (finals.length === 0 && generated.length > 0) {
-    const destinations = planDestinations({
-      target: outTarget,
-      count: generated.length,
-      edit,
-      force: Boolean(job.force)
+    let destinations;
+    if (generated.length === 1) {
+      destinations = [reserved];
+    } else if (outTarget.kind === "file") {
+      removeIfEmpty(reserved);
+      const ext = path.extname(outTarget.path);
+      const stem = (force ? outTarget.path : reserved).slice(0, -ext.length);
+      destinations = generated.map((_, index) => reserveFile(`${stem}-${index + 1}${ext}`, { force }));
+    } else {
+      destinations = generated.map((_, index) => (index === 0 ? reserved : reserveFile(path.join(outTarget.path, `${prefix}${index + 1}.png`), { force })));
+    }
+    generated.forEach((source, index) => {
+      const written = materialize({ source, destination: destinations[index], size: job.size, force, warnings });
+      finals.push({ path: written, source, inPlace: false });
     });
-    finals = copyGenerated({ generated, destinations, warnings });
   }
 
   if (finals.length === 0) {
+    discard();
     let reason;
     if (turn.timedOut) {
       reason = `codex timed out after ${Math.round(turn.timeoutMs / 1000)}s`;
@@ -959,7 +1249,8 @@ async function runImageJob(job, { onProgress } = {}) {
   const sips = hasSips();
   const lines = [];
   for (const final of finals) {
-    if (job.size) {
+    claimedPaths.add(final.path);
+    if (final.inPlace && job.size) {
       if (sips) {
         if (!applySize(final.path, job.size)) {
           warnings.push(`size not applied to ${final.path} (sips failed)`);
@@ -972,7 +1263,7 @@ async function runImageJob(job, { onProgress } = {}) {
     if (sips) {
       const info = sipsInfo(final.path);
       if (info) {
-        lines.push(`INFO: ${final.path} ${info.width}x${info.height} alpha=${info.alpha ? "yes" : "no"} source=${final.source}`);
+        lines.push(`INFO: ${final.path} ${info.width}x${info.height} alpha=${info.alpha ? "yes" : "no"}${final.source ? ` source=${final.source}` : ""}`);
       }
     }
   }
@@ -990,12 +1281,12 @@ function reportFailure(result) {
 }
 
 async function handleImageCommand(kind, argv) {
-  const raw = (argv.join(" ") || "").trim();
   const cwd = process.cwd();
   let parsed;
   let job;
   try {
-    parsed = kind === "edit" ? parseEditArguments(raw) : parseGenerateArguments(raw);
+    // A real argv keeps one token per element; a single string is split by the tokenizer.
+    parsed = kind === "edit" ? parseEditArguments(argv) : parseGenerateArguments(argv);
   } catch (error) {
     console.error(`Error: ${error.message}`);
     process.exitCode = 1;
@@ -1012,6 +1303,7 @@ async function handleImageCommand(kind, argv) {
   }
   try {
     resolveRunSettings(parsed);
+    resolveOutTarget(parsed.out, cwd);
     job = {
       kind,
       prompt: parsed.prompt,
@@ -1087,6 +1379,12 @@ function parseBatchManifest(text, baseDir, exists = fs.existsSync) {
     }
     if (item.out !== undefined && (typeof item.out !== "string" || !item.out)) {
       fail("out must be a non-empty string");
+    } else if (typeof item.out === "string") {
+      try {
+        resolveOutTarget(item.out, baseDir);
+      } catch (error) {
+        fail(error.message);
+      }
     }
     for (const key of ["transparent", "force"]) {
       if (item[key] !== undefined && typeof item[key] !== "boolean") {
@@ -1153,7 +1451,7 @@ async function handleBatch(argv) {
   let jobs;
   let settingsCheck;
   try {
-    options = parseBatchArguments(argv.join(" "));
+    options = parseBatchArguments(argv);
     if (!options.manifest) {
       throw new Error("Usage: /codex-image:batch <manifest.json> [--mode m] [--effort e] [--model s] [--parallel N]");
     }
@@ -1454,7 +1752,7 @@ function usage() {
     "  batch <manifest.json> [--mode m] [--effort e] [--model s] [--parallel N]",
     "",
     "Flags (generate, edit; before the prompt, `--` ends flags):",
-    "  --out <path>        file (.png/.jpg/.jpeg/.webp) or directory; default ./codex-images/",
+    "  --out <path>        file (.png/.jpg/.jpeg) or directory; default ./codex-images/",
     "  --size <W>x<H>      exact final size (cover + center-crop, needs sips on macOS)",
     "  --transparent       request a transparent background",
     "  --ref <path>        reference image (generate only, repeatable, max 5)",
@@ -1473,8 +1771,27 @@ function usage() {
   ].join("\n");
 }
 
+// `--args-stdin`: the raw argument string comes from our own stdin (SKILL.md heredoc with a
+// quoted delimiter, so the shell expands nothing). codex's stdin stays ignored.
+function expandArgsStdin(rest) {
+  if (!rest.includes("--args-stdin")) {
+    return rest;
+  }
+  if (rest.length > 1) {
+    throw new Error("--args-stdin cannot be combined with other arguments.");
+  }
+  let text = "";
+  try {
+    text = fs.readFileSync(0, "utf8");
+  } catch {
+    text = "";
+  }
+  return [text.replace(/\r?\n$/, "")];
+}
+
 async function main(argv = process.argv.slice(2)) {
-  const [command, ...rest] = argv;
+  const [command, ...restRaw] = argv;
+  const rest = ["generate", "edit", "batch"].includes(command) ? expandArgsStdin(restRaw) : restRaw;
 
   if (!command || command === "help" || command === "--help" || command === "-h") {
     console.log(usage());
@@ -1538,7 +1855,9 @@ export {
   buildSkillEditInstruction,
   buildSkillGenerateInstruction,
   buildStatusReport,
+  collectSkillResults,
   compareSemver,
+  createJsonlStreamer,
   createEventState,
   extractPromptAddDirs,
   getCodex,
@@ -1555,6 +1874,7 @@ export {
   parseSize,
   planDestinations,
   renderStatusReport,
+  reserveFile,
   resolveCodex,
   resolveCodexHome,
   resolveOutTarget,

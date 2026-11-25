@@ -13,8 +13,12 @@ A batch takes roughly 30-90 seconds per image divided by the parallelism. Run it
 Run:
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-image.mjs" batch "$ARGUMENTS"
+node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-image.mjs" batch --args-stdin <<'CODEX_IMAGE_ARGS'
+$ARGUMENTS
+CODEX_IMAGE_ARGS
 ```
+
+Run this block exactly as written: do not alter the heredoc, its delimiter or the arguments line (the quoted delimiter stops the shell from expanding `$`, backticks and quotes in the prompt). Inside the arguments, wrap any path that contains spaces in single or double quotes.
 
 Output rules:
 - Show only the `SAVED:`, `INFO:`, `ITEM <n> ok|failed ...` and `USAGE:` lines from stdout to the user.

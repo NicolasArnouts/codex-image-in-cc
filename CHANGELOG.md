@@ -28,6 +28,13 @@ Why: the old path (imagegen skill, gpt-5.6-sol high) took a median 82 s and abou
 - Model and effort are independent: `--model` / `CODEX_IMAGE_MODEL` (default: no `-m`, the account default) and `--effort` / `CODEX_IMAGE_EFFORT` (default low in direct mode, medium in skill mode). `minimal` and `none` are rejected (they hard-400).
 - `status --json`: dropped the deprecated `fullAuto` alias and the `orchestrator` field; added `home`, `defaults`, `sips`, `jsonOutput`.
 
+### Fixed (review)
+
+- CLI argv keeps one token per element (a spaced `--out` or manifest path used to be split); slash commands pass arguments through a quoted heredoc and `--args-stdin`, so `$`, backticks and quotes in prompts are literal.
+- Output file names are reserved atomically (`O_EXCL` placeholders) before spawning, finals are written via temp file and rename, and skill-mode results are only trusted when new, inside the out dir and unclaimed.
+- `.webp` out is rejected (sips cannot write it), as are other unknown extensions; `--transparent` with `.jpg` warns.
+- Missing thread id no longer sweeps all threads; the timeout kills the whole process group (SIGTERM, then SIGKILL); quoted tokens unescape `\"`.
+
 ### Removed
 
 - The orchestrator model ladder, the `codex debug models` catalog probe, the stderr monitor and the retry-without-model logic: hard-coded model slugs rot.
