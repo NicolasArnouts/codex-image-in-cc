@@ -1,59 +1,45 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import {
   CODEX_EXEC_BASE_ARGS,
-  buildEditInstruction,
+  buildCodexArgs,
+  buildDirectEditInstruction,
+  buildDirectGenerateInstruction,
   buildGenerateInstruction,
+  buildSkillEditInstruction,
+  buildSkillGenerateInstruction,
   compareSemver,
+  extractPromptAddDirs,
+  parseBatchArguments,
+  parseBatchManifest,
+  parseCodexJsonl,
+  parseEditArguments,
   parseGenerateArguments,
-  parseModelCatalog,
-  selectOrchestratorFromLadder,
-  resolveImageOrchestrator,
-  orchestratorArgs,
+  parseSavedLines,
+  planDestinations,
   resolveCodex,
+  resolveCodexHome,
+  resolveOutTarget,
+  resolveRunSettings,
   splitFirstToken,
-  timestampForFile
+  timestampForFile,
+  versionedPath
 } from "../scripts/codex-image.mjs";
 
-// A trimmed-down `codex debug models` catalog: luna caps at max (no ultra), terra and
-// sol carry high, and codex-auto-review is hidden (visibility != "list").
-const SAMPLE_CATALOG_JSON = JSON.stringify({
-  models: [
-    {
-      slug: "gpt-5.6-sol",
-      visibility: "list",
-      supported_reasoning_levels: [
-        { effort: "low" },
-        { effort: "medium" },
-        { effort: "high" },
-        { effort: "xhigh" },
-        { effort: "max" },
-        { effort: "ultra" }
-      ]
-    },
-    {
-      slug: "gpt-5.6-terra",
-      visibility: "list",
-      supported_reasoning_levels: [{ effort: "low" }, { effort: "medium" }, { effort: "high" }]
-    },
-    {
-      slug: "gpt-5.6-luna",
-      visibility: "list",
-      supported_reasoning_levels: [
-        { effort: "low" },
-        { effort: "medium" },
-        { effort: "high" },
-        { effort: "max" }
-      ]
-    },
-    {
-      slug: "codex-auto-review",
-      visibility: "hide",
-      supported_reasoning_levels: [{ effort: "medium" }]
-    }
-  ]
-});
+const here = path.dirname(fileURLToPath(import.meta.url));
+const SCRIPT = path.join(here, "..", "scripts", "codex-image.mjs");
+const FAKE_CODEX = path.join(here, "fixtures", "fake-codex.mjs");
+const isMac = process.platform === "darwin";
+
+// ---------------------------------------------------------------------------
+// Small helpers kept from earlier versions
+// ---------------------------------------------------------------------------
 
 test("compareSemver handles prefixed command output", () => {
   assert.equal(compareSemver("codex-cli 0.124.0", "0.124.0"), 0);
@@ -66,346 +52,604 @@ test("timestampForFile is filesystem-safe", () => {
 });
 
 test("splitFirstToken splits unquoted path from prompt", () => {
-  assert.deepEqual(splitFirstToken("photo.png make it red"), {
-    input: "photo.png",
-    prompt: "make it red"
-  });
+  assert.deepEqual(splitFirstToken("photo.png make it red"), { input: "photo.png", prompt: "make it red" });
 });
 
-test("splitFirstToken supports double-quoted path with spaces", () => {
-  assert.deepEqual(splitFirstToken('"my photo.png" tint blue'), {
-    input: "my photo.png",
-    prompt: "tint blue"
-  });
+test("splitFirstToken supports double- and single-quoted paths with spaces", () => {
+  assert.deepEqual(splitFirstToken('"my photo.png" tint blue'), { input: "my photo.png", prompt: "tint blue" });
+  assert.deepEqual(splitFirstToken("'a b.png' brighten"), { input: "a b.png", prompt: "brighten" });
 });
 
-test("splitFirstToken supports single-quoted path with spaces", () => {
-  assert.deepEqual(splitFirstToken("'a b.png' brighten"), {
-    input: "a b.png",
-    prompt: "brighten"
-  });
-});
-
-test("splitFirstToken returns nulls for empty input", () => {
-  assert.deepEqual(splitFirstToken(""), { input: null, prompt: null });
-  assert.deepEqual(splitFirstToken("   "), { input: null, prompt: null });
-});
-
-test("splitFirstToken returns input only when prompt is missing", () => {
-  assert.deepEqual(splitFirstToken("only-path.png"), {
-    input: "only-path.png",
-    prompt: ""
-  });
-});
-
-test("parseGenerateArguments returns prompt with no references", () => {
-  assert.deepEqual(parseGenerateArguments("draw a red kite"), {
-    referenceImages: [],
-    prompt: "draw a red kite"
-  });
-});
-
-test("parseGenerateArguments supports repeated reference flags", () => {
-  assert.deepEqual(parseGenerateArguments('--ref style.png --reference "subject photo.png" draw a poster'), {
-    referenceImages: ["style.png", "subject photo.png"],
-    prompt: "draw a poster"
-  });
-});
-
-test("parseGenerateArguments supports --image alias and equals form", () => {
-  assert.deepEqual(parseGenerateArguments("--image=style.png --ref pose.png draw a scene"), {
-    referenceImages: ["style.png", "pose.png"],
-    prompt: "draw a scene"
-  });
-});
-
-test("parseGenerateArguments supports delimiter before flag-like prompt text", () => {
-  assert.deepEqual(parseGenerateArguments("-- --ref should appear as literal prompt text"), {
-    referenceImages: [],
-    prompt: "--ref should appear as literal prompt text"
-  });
-});
-
-test("parseGenerateArguments rejects missing reference path", () => {
-  assert.throws(() => parseGenerateArguments("--ref"), /Missing value for --ref/);
-  assert.throws(() => parseGenerateArguments("--reference --ref style.png draw"), /Missing value for --reference/);
-});
-
-test("parseGenerateArguments rejects more than five reference images", () => {
-  const flags = Array.from({ length: 6 }, (_, index) => `--ref r${index}.png`).join(" ");
-  assert.throws(() => parseGenerateArguments(`${flags} draw a poster`), /at most 5/);
-});
-
-test("buildGenerateInstruction lists absolute reference paths for the codex turn", () => {
-  const instruction = buildGenerateInstruction("draw a poster", ["/abs/style.png", "/abs/subject photo.png"]);
-  assert.match(instruction, /1\. \/abs\/style\.png/);
-  assert.match(instruction, /2\. \/abs\/subject photo\.png/);
-  assert.match(instruction, /referenced_image_paths/);
-  assert.match(instruction, /SAVED: <absolute path>/);
-  assert.match(instruction, /draw a poster/);
-});
-
-test("buildGenerateInstruction omits the reference block without references", () => {
-  const instruction = buildGenerateInstruction("draw a poster", []);
-  assert.doesNotMatch(instruction, /Reference images for generation/);
-  assert.match(instruction, /draw a poster/);
-});
-
-test("buildEditInstruction names the edit target's absolute path", () => {
-  const instruction = buildEditInstruction("/abs/my photo.png", "tint it blue");
-  assert.match(instruction, /\/abs\/my photo\.png/);
-  assert.match(instruction, /referenced_image_paths/);
-  assert.match(instruction, /SAVED: <absolute path>/);
-  assert.match(instruction, /tint it blue/);
+test("splitFirstToken returns nulls for empty input and input-only when prompt is missing", () => {
+  assert.deepEqual(splitFirstToken("  "), { input: null, prompt: null });
+  assert.deepEqual(splitFirstToken("only.png"), { input: "only.png", prompt: "" });
 });
 
 test("resolveCodex uses the bare codex command outside Windows", { skip: process.platform === "win32" }, () => {
   assert.deepEqual(resolveCodex(), { command: "codex", prefix: [] });
 });
 
-test("parseModelCatalog keeps only visibility=list models and their efforts", () => {
-  const catalog = parseModelCatalog(SAMPLE_CATALOG_JSON);
-  assert.equal(catalog.size, 3);
-  assert.ok(catalog.has("gpt-5.6-luna"));
-  assert.ok(catalog.get("gpt-5.6-luna").has("high"));
-  assert.ok(!catalog.get("gpt-5.6-luna").has("ultra"));
-  assert.ok(catalog.get("gpt-5.6-sol").has("ultra"));
-  assert.ok(!catalog.has("codex-auto-review"));
+// ---------------------------------------------------------------------------
+// Flag parsing (guards: leading flags never leak into the prompt, prompt never lost)
+// ---------------------------------------------------------------------------
+
+test("parseGenerateArguments returns the prompt untouched when there are no flags", () => {
+  const parsed = parseGenerateArguments("A calm lake at dawn");
+  assert.equal(parsed.prompt, "A calm lake at dawn");
+  assert.deepEqual(parsed.referenceImages, []);
+  assert.equal(parsed.out, null);
+  assert.equal(parsed.transparent, false);
+  assert.equal(parsed.force, false);
 });
 
-test("parseModelCatalog tolerates a leading banner before the JSON object", () => {
-  const catalog = parseModelCatalog(`noise line\n${SAMPLE_CATALOG_JSON}`);
-  assert.ok(catalog.has("gpt-5.6-terra"));
+test("parseGenerateArguments parses every flag in space form", () => {
+  const parsed = parseGenerateArguments(
+    "--ref a.png --reference b.png --image c.png --out out/hero.png --size 1200x630 --transparent --mode skill --effort high --model gpt-x --force A hero"
+  );
+  assert.deepEqual(parsed.referenceImages, ["a.png", "b.png", "c.png"]);
+  assert.equal(parsed.out, "out/hero.png");
+  assert.deepEqual(parsed.size, { width: 1200, height: 630 });
+  assert.equal(parsed.transparent, true);
+  assert.equal(parsed.mode, "skill");
+  assert.equal(parsed.effort, "high");
+  assert.equal(parsed.model, "gpt-x");
+  assert.equal(parsed.force, true);
+  assert.equal(parsed.prompt, "A hero");
 });
 
-test("parseModelCatalog returns an empty map on unusable input", () => {
-  assert.equal(parseModelCatalog("").size, 0);
-  assert.equal(parseModelCatalog("not json").size, 0);
-  assert.equal(parseModelCatalog('{"models":"nope"}').size, 0);
+test("parseGenerateArguments accepts --flag=value forms", () => {
+  const parsed = parseGenerateArguments("--ref=a.png --out=x/y.webp --size=64X32 --mode=direct --effort=LOW --model=m draw it");
+  assert.deepEqual(parsed.referenceImages, ["a.png"]);
+  assert.equal(parsed.out, "x/y.webp");
+  assert.deepEqual(parsed.size, { width: 64, height: 32 });
+  assert.equal(parsed.effort, "low");
+  assert.equal(parsed.prompt, "draw it");
 });
 
-test("selectOrchestratorFromLadder picks the top available rung (luna high)", () => {
-  const catalog = parseModelCatalog(SAMPLE_CATALOG_JSON);
-  assert.deepEqual(selectOrchestratorFromLadder(catalog), {
-    model: "gpt-5.6-luna",
-    effort: "high"
-  });
+test("parseGenerateArguments supports quoted paths with spaces", () => {
+  const parsed = parseGenerateArguments('--ref "my ref.png" --out "out dir/a b.png" A cat');
+  assert.deepEqual(parsed.referenceImages, ["my ref.png"]);
+  assert.equal(parsed.out, "out dir/a b.png");
+  assert.equal(parsed.prompt, "A cat");
 });
 
-test("selectOrchestratorFromLadder falls to terra medium when luna is absent", () => {
-  const catalog = new Map([
-    ["gpt-5.6-terra", new Set(["low", "medium", "high"])],
-    ["gpt-5.6-sol", new Set(["low", "high"])]
-  ]);
-  assert.deepEqual(selectOrchestratorFromLadder(catalog), {
-    model: "gpt-5.6-terra",
-    effort: "medium"
-  });
+test("parseGenerateArguments: `--` ends flags so a flag-like prompt survives", () => {
+  const parsed = parseGenerateArguments("--out a.png -- --force is the prompt");
+  assert.equal(parsed.out, "a.png");
+  assert.equal(parsed.force, false);
+  assert.equal(parsed.prompt, "--force is the prompt");
 });
 
-test("selectOrchestratorFromLadder skips a rung whose effort is unsupported", () => {
-  // luna present but without "high" -> skip luna high, land on terra medium.
-  const catalog = new Map([
-    ["gpt-5.6-luna", new Set(["low", "medium"])],
-    ["gpt-5.6-terra", new Set(["low", "medium", "high"])]
-  ]);
-  assert.deepEqual(selectOrchestratorFromLadder(catalog), {
-    model: "gpt-5.6-terra",
-    effort: "medium"
-  });
+test("parseGenerateArguments treats an unknown --flag as the start of the prompt", () => {
+  const parsed = parseGenerateArguments("--out a.png --weird thing here");
+  assert.equal(parsed.prompt, "--weird thing here");
 });
 
-test("selectOrchestratorFromLadder returns null with no catalog or no match", () => {
-  assert.equal(selectOrchestratorFromLadder(null), null);
-  assert.equal(selectOrchestratorFromLadder(new Map()), null);
-  assert.equal(selectOrchestratorFromLadder(new Map([["gpt-9.9", new Set(["high"])]])), null);
+test("parseGenerateArguments rejects missing values, bad size, bad effort, bad mode", () => {
+  assert.throws(() => parseGenerateArguments("--ref"), /Missing value for --ref/);
+  assert.throws(() => parseGenerateArguments("--out --force x"), /Missing value for --out/);
+  assert.throws(() => parseGenerateArguments("--size 0x10 x"), /Invalid size/);
+  assert.throws(() => parseGenerateArguments("--size 9000x10 x"), /Invalid size/);
+  assert.throws(() => parseGenerateArguments("--size big x"), /Invalid size/);
+  assert.throws(() => parseGenerateArguments("--effort minimal x"), /minimal/);
+  assert.throws(() => parseGenerateArguments("--effort none x"), /none/);
+  assert.throws(() => parseGenerateArguments("--mode fast x"), /Invalid --mode/);
 });
 
-test("resolveImageOrchestrator uses the ladder when no env override is set", () => {
-  const catalog = parseModelCatalog(SAMPLE_CATALOG_JSON);
-  assert.deepEqual(resolveImageOrchestrator({ catalog }), {
-    model: "gpt-5.6-luna",
+test("parseGenerateArguments rejects more than five reference images", () => {
+  const flags = Array.from({ length: 6 }, (_, i) => `--ref r${i}.png`).join(" ");
+  assert.throws(() => parseGenerateArguments(`${flags} prompt`), /Too many reference images/);
+});
+
+test("parseEditArguments: flags first, then input path, then the prompt (quoted path ok)", () => {
+  const parsed = parseEditArguments('--out e.png --force "my photo.png" make it red');
+  assert.equal(parsed.out, "e.png");
+  assert.equal(parsed.force, true);
+  assert.equal(parsed.input, "my photo.png");
+  assert.equal(parsed.prompt, "make it red");
+  const plain = parseEditArguments("photo.png tint blue");
+  assert.equal(plain.input, "photo.png");
+  assert.equal(plain.prompt, "tint blue");
+});
+
+test("parseEditArguments does not take --ref as a reference flag", () => {
+  const parsed = parseEditArguments("--ref x.png y.png");
+  assert.deepEqual(parsed.referenceImages, []);
+  assert.equal(parsed.input, "--ref");
+});
+
+// ---------------------------------------------------------------------------
+// Settings and home resolution
+// ---------------------------------------------------------------------------
+
+test("resolveRunSettings: flag beats env beats mode default; model is optional", () => {
+  assert.deepEqual(resolveRunSettings({}, {}), { mode: "direct", effort: "low", model: null });
+  assert.deepEqual(resolveRunSettings({ mode: "skill" }, {}), { mode: "skill", effort: "medium", model: null });
+  assert.deepEqual(resolveRunSettings({}, { CODEX_IMAGE_MODE: "skill", CODEX_IMAGE_EFFORT: "high", CODEX_IMAGE_MODEL: "m1" }), {
+    mode: "skill",
     effort: "high",
-    source: "ladder"
+    model: "m1"
+  });
+  assert.deepEqual(resolveRunSettings({ effort: "max", model: "m2" }, { CODEX_IMAGE_EFFORT: "high", CODEX_IMAGE_MODEL: "m1" }), {
+    mode: "direct",
+    effort: "max",
+    model: "m2"
   });
 });
 
-test("resolveImageOrchestrator returns null when the ladder finds nothing", () => {
-  assert.equal(resolveImageOrchestrator({ catalog: new Map() }), null);
-  assert.equal(resolveImageOrchestrator({ catalog: null }), null);
+test("resolveRunSettings: effort and model are independent (no both-required rule) and bad env fails", () => {
+  assert.equal(resolveRunSettings({}, { CODEX_IMAGE_MODEL: "only-model" }).effort, "low");
+  assert.equal(resolveRunSettings({}, { CODEX_IMAGE_EFFORT: "ultra" }).model, null);
+  assert.throws(() => resolveRunSettings({}, { CODEX_IMAGE_EFFORT: "minimal" }), /CODEX_IMAGE_EFFORT/);
+  assert.throws(() => resolveRunSettings({}, { CODEX_IMAGE_MODE: "x" }), /CODEX_IMAGE_MODE/);
 });
 
-test("resolveImageOrchestrator honors an explicit env override and lowercases effort", () => {
-  assert.deepEqual(
-    resolveImageOrchestrator({ envModel: "gpt-5.6-terra", envEffort: "High", catalog: new Map() }),
-    { model: "gpt-5.6-terra", effort: "high", source: "env" }
-  );
+test("resolveCodexHome precedence: CODEX_IMAGE_HOME > ~/.codex-image > CODEX_HOME > ~/.codex", () => {
+  const homedir = "/home/u";
+  const yes = () => true;
+  const no = () => false;
+  assert.equal(resolveCodexHome({ env: { CODEX_IMAGE_HOME: "/x", CODEX_HOME: "/y" }, homedir, exists: yes }).path, "/x");
+  assert.equal(resolveCodexHome({ env: { CODEX_HOME: "/y" }, homedir, exists: yes }).path, "/home/u/.codex-image");
+  assert.equal(resolveCodexHome({ env: { CODEX_HOME: "/y" }, homedir, exists: yes }).dedicated, true);
+  assert.equal(resolveCodexHome({ env: { CODEX_HOME: "/y" }, homedir, exists: no }).path, "/y");
+  assert.equal(resolveCodexHome({ env: {}, homedir, exists: no }).path, "/home/u/.codex");
 });
 
-test("resolveImageOrchestrator requires both override vars together", () => {
-  assert.throws(
-    () => resolveImageOrchestrator({ envModel: "gpt-5.6-terra" }),
-    /must be set together/
-  );
-  assert.throws(() => resolveImageOrchestrator({ envEffort: "high" }), /must be set together/);
+// ---------------------------------------------------------------------------
+// Out-path planning (guards: never overwrite silently, naming contract)
+// ---------------------------------------------------------------------------
+
+test("resolveOutTarget: image extension (any case) is a file, otherwise a directory, default ./codex-images", () => {
+  assert.deepEqual(resolveOutTarget("a/hero.PNG", "/w"), { kind: "file", path: "/w/a/hero.PNG", dir: "/w/a" });
+  assert.equal(resolveOutTarget("a/b.jpeg", "/w").kind, "file");
+  assert.equal(resolveOutTarget("a/b.webp", "/w").kind, "file");
+  assert.deepEqual(resolveOutTarget("a/logos", "/w"), { kind: "dir", path: "/w/a/logos", dir: "/w/a/logos" });
+  assert.deepEqual(resolveOutTarget(undefined, "/w"), { kind: "dir", path: "/w/codex-images", dir: "/w/codex-images" });
+  assert.equal(resolveOutTarget("/abs/x.png", "/w").path, "/abs/x.png");
 });
 
-test("resolveImageOrchestrator rejects an invalid override effort", () => {
-  assert.throws(
-    () => resolveImageOrchestrator({ envModel: "gpt-5.6-terra", envEffort: "turbo" }),
-    /Invalid CODEX_IMAGE_EFFORT/
-  );
+test("versionedPath returns hero-v2, hero-v3 ... when the file exists", () => {
+  const taken = new Set(["/o/hero.png", "/o/hero-v2.png"]);
+  const exists = (file) => taken.has(file);
+  assert.equal(versionedPath("/o/new.png", exists), "/o/new.png");
+  assert.equal(versionedPath("/o/hero.png", exists), "/o/hero-v3.png");
 });
 
-test("isOrchestratorRejection matches the live 0.144.5 rejection shape", async () => {
-  const { isOrchestratorRejection } = await import("../scripts/codex-image.mjs");
-  // Captured verbatim from codex-cli 0.144.5 with a bogus -m slug.
-  assert.equal(
-    isOrchestratorRejection(
-      `ERROR: {"type":"error","status":400,"error":{"type":"invalid_request_error","message":"The 'totally-bogus-model-xyz' model is not supported when using Codex with a ChatGPT account."}}`
-    ),
-    true
-  );
+test("planDestinations: single file, multi-image naming, force, directory defaults", () => {
+  const file = { kind: "file", path: "/o/hero.png", dir: "/o" };
+  const none = () => false;
+  assert.deepEqual(planDestinations({ target: file, count: 1, exists: none }), ["/o/hero.png"]);
+  assert.deepEqual(planDestinations({ target: file, count: 3, exists: none }), ["/o/hero-1.png", "/o/hero-2.png", "/o/hero-3.png"]);
+  const taken = new Set(["/o/hero.png", "/o/hero-2.png"]);
+  const exists = (f) => taken.has(f);
+  assert.deepEqual(planDestinations({ target: file, count: 1, exists }), ["/o/hero-v2.png"]);
+  assert.deepEqual(planDestinations({ target: file, count: 2, exists }), ["/o/hero-1.png", "/o/hero-2-v2.png"]);
+  assert.deepEqual(planDestinations({ target: file, count: 1, exists, force: true }), ["/o/hero.png"]);
+  const dir = { kind: "dir", path: "/o/d", dir: "/o/d" };
+  assert.deepEqual(planDestinations({ target: dir, count: 2, timestamp: "T", exists: none }), ["/o/d/T-1.png", "/o/d/T-2.png"]);
+  assert.deepEqual(planDestinations({ target: dir, count: 1, timestamp: "T", edit: true, exists: none }), ["/o/d/T-edit-1.png"]);
 });
 
-test("isOrchestratorRejection matches other known model/effort rejection shapes", async () => {
-  const { isOrchestratorRejection } = await import("../scripts/codex-image.mjs");
-  assert.equal(isOrchestratorRejection("ERROR: model gpt-5.6-luna is not available for this account"), true);
-  assert.equal(isOrchestratorRejection("ERROR: Unknown model: gpt-5.6-luna"), true);
-  assert.equal(isOrchestratorRejection('ERROR: {"code":"model_not_found"}'), true);
-  assert.equal(isOrchestratorRejection("ERROR: The model 'gpt-5.6-luna' does not exist"), true);
-  assert.equal(isOrchestratorRejection("ERROR: unsupported reasoning effort: high"), true);
-  assert.equal(isOrchestratorRejection("ERROR: invalid value for model_reasoning_effort"), true);
+// ---------------------------------------------------------------------------
+// Instructions and codex args
+// ---------------------------------------------------------------------------
+
+test("direct generate instruction: no file ops, prompt unchanged, DONE contract, refs, size, transparency", () => {
+  const text = buildDirectGenerateInstruction({
+    prompt: "a red fox",
+    referenceImagePaths: ["/r/a.png", "/r/b.png"],
+    transparent: true,
+    size: { width: 1200, height: 630 }
+  });
+  assert.match(text, /image_gen\.imagegen/);
+  assert.match(text, /do not run shell commands/);
+  assert.match(text, /Set transparent_background to true\./);
+  assert.match(text, /referenced_image_paths:\n\/r\/a\.png\n\/r\/b\.png/);
+  assert.match(text, /1200x630/);
+  assert.match(text, /exactly one line: DONE\./);
+  assert.ok(text.endsWith("Request:\n\na red fox"));
+  const plain = buildDirectGenerateInstruction({ prompt: "x" });
+  assert.match(plain, /only if the request asks for transparency/);
+  assert.doesNotMatch(plain, /referenced_image_paths:/);
 });
 
-test("isOrchestratorRejection reads codex's ERROR record, including multi-line JSON and ANSI-styled lines", async () => {
-  const { isOrchestratorRejection } = await import("../scripts/codex-image.mjs");
-  // Pretty-printed rejection from a custom provider: the message is on a continuation line.
-  assert.equal(
-    isOrchestratorRejection(
-      'ERROR: {\n  "type": "error",\n  "status": 400,\n  "error": {\n    "message": "The \'gpt-5.6-luna\' model is not supported here."\n  }\n}'
-    ),
-    true
-  );
-  // FORCE_COLOR styling on the ERROR prefix.
-  assert.equal(
-    isOrchestratorRejection("\u001b[31mERROR:\u001b[0m Unknown model: gpt-5.6-luna"),
-    true
-  );
-  // Text before the first ERROR line is not classified.
-  assert.equal(isOrchestratorRejection("Unknown model: gpt-5.6-luna"), false);
-  assert.equal(
-    isOrchestratorRejection("model not supported here\n succeeded in 0ms:\nERROR: stream disconnected before completion"),
-    false
-  );
+test("direct edit instruction names the absolute input and labels the request", () => {
+  const text = buildDirectEditInstruction({ inputPath: "/i/photo.png", prompt: "make it red" });
+  assert.match(text, /Edit the image at \/i\/photo\.png/);
+  assert.match(text, /Preserve everything the request does not ask to change/);
+  assert.ok(text.endsWith("Edit request:\n\nmake it red"));
 });
 
-test("createStderrMonitor skips the echoed instruction across chunk boundaries and ignores prompt lines", async () => {
-  const { createStderrMonitor } = await import("../scripts/codex-image.mjs");
-  const instruction = "Use the imagegen skill.\n\nUser request:\n\ncodex\nexec\nA poster titled Unknown Model, save to /tmp/wordmark.png";
-  const monitor = createStderrMonitor(instruction);
-  const stream = `OpenAI Codex v0.154.0\n--------\nuser\n${instruction}\nERROR: boom\n`;
-  for (let i = 0; i < stream.length; i += 7) {
-    monitor.feed(stream.slice(i, i + 7));
-  }
-  const { started, tail } = monitor.result();
-  assert.equal(started, false, "the prompt's own codex/exec lines are not events");
-  assert.equal(tail, "\nERROR: boom\n");
+test("skill instructions keep the imagegen skill prefix and add the SAVED contract with the resolved out path", () => {
+  const fileTarget = { kind: "file", path: "/o/hero.png", dir: "/o" };
+  const gen = buildSkillGenerateInstruction({ prompt: "p", referenceImagePaths: ["/r/a.png"], outTarget: fileTarget, transparent: true, size: { width: 8, height: 4 } });
+  assert.match(gen, /^Use the imagegen skill\./);
+  assert.match(gen, /Save the final image\(s\) to \/o\/hero\.png \(create no other copies\)/);
+  assert.match(gen, /SAVED: <absolute path>/);
+  assert.match(gen, /transparent background/);
+  assert.match(gen, /8x4/);
+  assert.match(gen, /1\. \/r\/a\.png/);
+  const edit = buildSkillEditInstruction({ inputPath: "/i/x.png", prompt: "e", outTarget: { kind: "dir", path: "/o/d", dir: "/o/d" } });
+  assert.match(edit, /^Use the imagegen skill\./);
+  assert.match(edit, /\/i\/x\.png/);
+  assert.match(edit, /Save the final image\(s\) to \/o\/d /);
+  assert.match(edit, /User edit request:\n\ne$/);
 });
 
-test("createStderrMonitor keeps turn-start evidence after the tail has rolled past it", async () => {
-  const { createStderrMonitor, shouldRetryWithoutOrchestrator } = await import("../scripts/codex-image.mjs");
-  const instruction = "Use the imagegen skill.\n\nUser request:\n\nA wordmark saved to /tmp/wordmark.png";
-  const monitor = createStderrMonitor(instruction);
-  monitor.feed(`OpenAI Codex v0.154.0\nuser\n${instruction}\n`);
-  // A real tool call whose command ends with the prompt's last line, then enough
-  // tool output to push everything out of the bounded tail, then a rejection-like error.
-  monitor.feed("codex\nRunning the skill.\nexec\n/bin/zsh -lc 'sips -z 512 512 /tmp/wordmark.png'\n succeeded in 0ms:\n");
-  monitor.feed(`${"x".repeat(20000)}\n`);
-  monitor.feed("ERROR: The 'gpt-5.6-luna' model is not supported\n");
-  const result = monitor.result();
-  assert.equal(result.started, true);
-  assert.ok(!result.tail.includes("exec\n"), "the tail has lost the marker; the flag must not");
-  assert.equal(shouldRetryWithoutOrchestrator(result), false);
+test("buildGenerateInstruction dispatches on mode", () => {
+  assert.match(buildGenerateInstruction({ mode: "direct", prompt: "p" }), /^Generate the image/);
+  assert.match(buildGenerateInstruction({ mode: "skill", prompt: "p", outTarget: { kind: "dir", path: "/o", dir: "/o" } }), /^Use the imagegen skill/);
 });
 
-test("createStderrMonitor recognises ANSI-styled event lines and a final unterminated line", async () => {
-  const { createStderrMonitor } = await import("../scripts/codex-image.mjs");
-  const instruction = "A tiny grey circle";
-  const styled = createStderrMonitor(instruction);
-  styled.feed(`user\n${instruction}\n\u001b[1mexec\u001b[0m\n/bin/zsh -lc 'ls'\n`);
-  assert.equal(styled.result().started, true);
-  const unterminated = createStderrMonitor(instruction);
-  unterminated.feed(`user\n${instruction}\ncodex`);
-  assert.equal(unterminated.result().started, true);
-});
-
-test("createStderrMonitor classifies conservatively when the echo never appears", async () => {
-  const { createStderrMonitor, shouldRetryWithoutOrchestrator } = await import("../scripts/codex-image.mjs");
-  // Failure before any echo (e.g. auth): classify what was printed.
-  const early = createStderrMonitor("some instruction");
-  early.feed("ERROR: The 'x' model is not supported\n");
-  assert.equal(shouldRetryWithoutOrchestrator(early.result()), true);
-  // Echo format changed and the turn ran: the event lines still count, so no retry.
-  const changed = createStderrMonitor("some instruction");
-  changed.feed("user\n(prompt rendered differently)\nexec\n/bin/zsh -lc 'ls'\nERROR: The 'x' model is not supported\n");
-  assert.equal(shouldRetryWithoutOrchestrator(changed.result()), false);
-});
-
-test("shouldRetryWithoutOrchestrator fires only for a startup rejection", async () => {
-  const { createStderrMonitor, shouldRetryWithoutOrchestrator } = await import("../scripts/codex-image.mjs");
-  const rejection =
-    `ERROR: {"type":"error","status":400,"error":{"type":"invalid_request_error","message":"The 'gpt-5.6-luna' model is not supported when using Codex with a ChatGPT account."}}`;
-  const instruction = "Use the imagegen skill.\n\nUser request:\n\ncodex\nexec\nA poster titled Unknown Model";
-  const run = (afterEcho) => {
-    const monitor = createStderrMonitor(instruction);
-    monitor.feed(`OpenAI Codex v0.154.0\n--------\nmodel: gpt-5.6-luna\n--------\nuser\n${instruction}\n${afterEcho}`);
-    return monitor.result();
-  };
-  // Startup rejection right after the echo (which itself contains event-like and
-  // rejection-like lines): retry.
-  assert.equal(shouldRetryWithoutOrchestrator(run(`${rejection}\n`)), true);
-  // Unrelated failure at startup: no retry.
-  assert.equal(shouldRetryWithoutOrchestrator(run("ERROR: stream disconnected before completion\n")), false);
-  assert.equal(shouldRetryWithoutOrchestrator(run("ERROR: you've hit your usage limit\n")), false);
-  // Same rejection text after the turn produced a tool call: no retry.
-  assert.equal(
-    shouldRetryWithoutOrchestrator(run(`codex\nUsing the imagegen skill.\nexec\n/bin/zsh -lc 'sed -n 1,40p SKILL.md'\n succeeded in 0ms:\n...\n${rejection}\n`)),
-    false
-  );
-  // No monitor (stderr not captured): never retry.
-  assert.equal(shouldRetryWithoutOrchestrator(null), false);
-});
-
-test("isOrchestratorRejection ignores unrelated failures", async () => {
-  const { isOrchestratorRejection } = await import("../scripts/codex-image.mjs");
-  assert.equal(isOrchestratorRejection("you've hit your usage limit"), false);
-  assert.equal(isOrchestratorRejection("stream disconnected before completion"), false);
-  assert.equal(isOrchestratorRejection("401 Unauthorized: please run codex login"), false);
-  assert.equal(isOrchestratorRejection(""), false);
-  assert.equal(isOrchestratorRejection(null), false);
-});
-
-test("base exec args use the documented sandbox flag and pin approval-never", () => {
-  // `--full-auto` was removed from `codex exec` in Codex CLI 0.151.0 (#5); the
-  // explicit approval override keeps the approval-never contract under auto_review.
-  assert.deepEqual(CODEX_EXEC_BASE_ARGS, [
-    "exec",
-    "--sandbox",
-    "workspace-write",
-    "-c",
-    'approval_policy="never"',
-    "--skip-git-repo-check"
-  ]);
+test("buildCodexArgs: --json, --add-dir, -o, effort -c, no -m without model, -m with model, never --full-auto", () => {
+  const args = buildCodexArgs({
+    cwd: "/w",
+    effort: "low",
+    addDirs: ["/o", "/o"],
+    lastMessageFile: "/t/last.txt",
+    images: ["/i/a.png"],
+    instruction: "do it"
+  });
+  assert.ok(args.includes("--json"));
+  assert.equal(args[0], "exec");
+  assert.ok(args.includes("--skip-git-repo-check"));
+  assert.equal(args[args.indexOf("--sandbox") + 1], "workspace-write");
+  assert.ok(args.includes('approval_policy="never"'));
+  assert.ok(args.includes('model_reasoning_effort="low"'));
+  assert.equal(args[args.indexOf("--add-dir") + 1], "/o");
+  assert.equal(args.filter((a) => a === "--add-dir").length, 1, "add-dir deduplicated");
+  assert.equal(args[args.indexOf("-o") + 1], "/t/last.txt");
+  assert.equal(args[args.indexOf("--image") + 1], "/i/a.png");
+  assert.equal(args[args.indexOf("-C") + 1], "/w");
+  assert.ok(!args.includes("-m"));
+  assert.ok(!args.includes("--full-auto"));
+  assert.deepEqual(args.slice(-2), ["--", "do it"]);
+  assert.ok(buildCodexArgs({ cwd: "/w", effort: "high", model: "gpt-x", instruction: "i" }).join(" ").includes("-m gpt-x"));
   assert.ok(!CODEX_EXEC_BASE_ARGS.includes("--full-auto"));
 });
 
-test("orchestratorArgs builds -m/-c with a TOML-quoted effort, or [] when null", () => {
-  assert.deepEqual(orchestratorArgs({ model: "gpt-5.6-luna", effort: "high" }), [
-    "-m",
-    "gpt-5.6-luna",
-    "-c",
-    'model_reasoning_effort="high"'
-  ]);
-  assert.deepEqual(orchestratorArgs(null), []);
+test("extractPromptAddDirs: nearest existing ancestor of absolute image paths, deduped, never /", () => {
+  const existing = new Set(["/", "/Users", "/Users/k", "/Users/k/refs"]);
+  const exists = (d) => existing.has(d);
+  const prompt = "mix /Users/k/refs/a.png and /Users/k/refs/b.JPG with /Users/k/new/deep/c.webp and /nope/d.png, relative x.png";
+  assert.deepEqual(extractPromptAddDirs(prompt, exists).sort(), ["/Users/k", "/Users/k/refs"]);
+  assert.deepEqual(extractPromptAddDirs("no paths here", exists), []);
+});
+
+// ---------------------------------------------------------------------------
+// JSONL parser against real Codex output
+// ---------------------------------------------------------------------------
+
+test("parseCodexJsonl reads the real direct-mode fixture (thread, messages, usage, deduped warnings)", () => {
+  const state = parseCodexJsonl(fs.readFileSync(path.join(here, "fixtures", "direct-low.jsonl"), "utf8"));
+  assert.equal(state.threadId, "01a2125a-befc-7660-bac0-260fa341315d");
+  assert.deepEqual(state.messages, ["I’ll pass your prompt unchanged to the image generation tool.", "DONE"]);
+  assert.deepEqual(state.usage, { input: 37079, cached: 23808, output: 93 });
+  assert.equal(state.warnings.length, 1, "identical non-fatal errors are deduped");
+  assert.deepEqual(state.failures, []);
+});
+
+test("parseCodexJsonl reads the real skill-mode fixture and exposes SAVED lines", () => {
+  const state = parseCodexJsonl(fs.readFileSync(path.join(here, "fixtures", "skill-medium.jsonl"), "utf8"));
+  assert.equal(state.threadId, "01a2125b-46bf-7391-8ae1-c875a9b6f181");
+  assert.deepEqual(state.usage, { input: 84665, cached: 61568, output: 506 });
+  assert.deepEqual(parseSavedLines(state.messages.join("\n")), ["/tmp/fixture/skill-medium.png"]);
+});
+
+test("parseCodexJsonl ignores non-JSON lines and records turn.failed / top-level error events", () => {
+  const text = [
+    "warning: plain text",
+    "{ broken json",
+    '{"type":"thread.started","thread_id":"t1"}',
+    '{"type":"error","message":"stream died"}',
+    '{"type":"turn.failed","error":{"message":"model not supported"}}'
+  ].join("\n");
+  const state = parseCodexJsonl(text);
+  assert.equal(state.threadId, "t1");
+  assert.deepEqual(state.failures, ["stream died", "model not supported"]);
+});
+
+// ---------------------------------------------------------------------------
+// Batch manifest / arguments
+// ---------------------------------------------------------------------------
+
+test("parseBatchManifest normalizes items, resolves paths against the manifest dir, and picks the kind", () => {
+  const jobs = parseBatchManifest(
+    JSON.stringify([
+      { prompt: " one ", out: "out/a.png", size: "64x32", transparent: true },
+      { prompt: "two", edit: "in.png", force: true },
+      { prompt: "three", refs: ["r.png"] }
+    ]),
+    "/m",
+    () => true
+  );
+  assert.equal(jobs[0].kind, "generate");
+  assert.equal(jobs[0].prompt, "one");
+  assert.equal(jobs[0].out, "/m/out/a.png");
+  assert.deepEqual(jobs[0].size, { width: 64, height: 32 });
+  assert.equal(jobs[1].kind, "edit");
+  assert.equal(jobs[1].inputPath, "/m/in.png");
+  assert.equal(jobs[1].force, true);
+  assert.deepEqual(jobs[2].referenceImagePaths, ["/m/r.png"]);
+});
+
+test("parseBatchManifest rejects the whole manifest before anything runs", () => {
+  const yes = () => true;
+  assert.throws(() => parseBatchManifest("nope", "/m", yes), /not valid JSON/);
+  assert.throws(() => parseBatchManifest("{}", "/m", yes), /non-empty JSON array/);
+  assert.throws(() => parseBatchManifest("[]", "/m", yes), /non-empty JSON array/);
+  const tooMany = JSON.stringify(Array.from({ length: 21 }, () => ({ prompt: "x" })));
+  assert.throws(() => parseBatchManifest(tooMany, "/m", yes), /maximum is 20/);
+  assert.throws(() => parseBatchManifest(JSON.stringify([{ prompt: "ok" }, { prompt: "" }]), "/m", yes), /item 2: prompt/);
+  assert.throws(() => parseBatchManifest(JSON.stringify([{ prompt: "x", size: "huge" }]), "/m", yes), /item 1: Invalid size/);
+  assert.throws(() => parseBatchManifest(JSON.stringify([{ prompt: "x", edit: "i.png", refs: ["r.png"] }]), "/m", yes), /refs cannot be combined with edit/);
+  assert.throws(() => parseBatchManifest(JSON.stringify([{ prompt: "x", bogus: 1 }]), "/m", yes), /unknown field "bogus"/);
+  assert.throws(() => parseBatchManifest(JSON.stringify([{ prompt: "x", refs: ["r.png"] }]), "/m", () => false), /reference image not found/);
+});
+
+test("parseBatchArguments parses manifest, flags, and bounds --parallel", () => {
+  const options = parseBatchArguments('"my m.json" --parallel 2 --mode skill --effort=high --model x');
+  assert.equal(options.manifest, "my m.json");
+  assert.equal(options.parallel, 2);
+  assert.equal(options.mode, "skill");
+  assert.equal(options.effort, "high");
+  assert.equal(options.model, "x");
+  assert.equal(parseBatchArguments("m.json").parallel, 1);
+  assert.throws(() => parseBatchArguments("m.json --parallel 4"), /Invalid --parallel/);
+  assert.throws(() => parseBatchArguments("m.json --parallel 0"), /Invalid --parallel/);
+  assert.throws(() => parseBatchArguments("m.json --wat 1"), /Unknown batch option/);
+});
+
+// ---------------------------------------------------------------------------
+// Hermetic end-to-end tests with a fake codex (no real codex, no network)
+// ---------------------------------------------------------------------------
+
+function makeSandbox() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-image-test-"));
+  const home = path.join(dir, "home");
+  fs.mkdirSync(home);
+  return { dir, home, cleanup: () => fs.rmSync(dir, { recursive: true, force: true }) };
+}
+
+function runCli(sandbox, args, extraEnv = {}) {
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, [SCRIPT, ...args], {
+      cwd: sandbox.dir,
+      env: {
+        ...process.env,
+        CODEX_IMAGE_CODEX_BIN: FAKE_CODEX,
+        CODEX_IMAGE_HOME: sandbox.home,
+        CODEX_IMAGE_MODE: "",
+        CODEX_IMAGE_EFFORT: "",
+        CODEX_IMAGE_MODEL: "",
+        ...extraEnv
+      },
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => (stdout += chunk));
+    child.stderr.on("data", (chunk) => (stderr += chunk));
+    child.on("close", (status) => resolve({ status, stdout, stderr }));
+  });
+}
+
+const savedPaths = (stdout) => [...stdout.matchAll(/^SAVED: (.+)$/gm)].map((m) => m[1]);
+
+test("e2e generate --out file: SAVED path exists, USAGE line present, stdout holds only contract lines", async () => {
+  const sb = makeSandbox();
+  try {
+    const out = path.join(sb.dir, "img", "hero.png");
+    const log = path.join(sb.dir, "args.log");
+    const result = await runCli(sb, ["generate", "--out", out, "a fox"], { FAKE_CODEX_LOG: log });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(savedPaths(result.stdout), [out]);
+    assert.ok(fs.existsSync(out));
+    assert.ok(fs.readFileSync(out).subarray(1, 4).toString() === "PNG");
+    assert.match(result.stdout, /^USAGE: mode=direct model=account-default effort=low secs=\d+ input=100 cached=40 output=7 thread=[0-9a-f-]+$/m);
+    for (const line of result.stdout.trim().split("\n")) {
+      assert.match(line, /^(SAVED|INFO|USAGE): /, `unexpected stdout line: ${line}`);
+    }
+    assert.match(result.stderr, /codex-image: thread .* started/);
+    assert.match(result.stderr, /codex-image: codex: DONE/);
+    const argv = JSON.parse(fs.readFileSync(log, "utf8").trim().split("\n")[0]);
+    assert.ok(argv.includes("--json") && !argv.includes("-m") && !argv.includes("--full-auto"));
+    assert.equal(argv[argv.indexOf("--add-dir") + 1], path.dirname(out));
+  } finally {
+    sb.cleanup();
+  }
+});
+
+test("e2e second run without --force writes a -v2 sibling, --force overwrites", async () => {
+  const sb = makeSandbox();
+  try {
+    const out = path.join(sb.dir, "hero.png");
+    const first = await runCli(sb, ["generate", "--out", out, "x"]);
+    assert.deepEqual(savedPaths(first.stdout), [out]);
+    const second = await runCli(sb, ["generate", "--out", out, "x"]);
+    assert.deepEqual(savedPaths(second.stdout), [path.join(sb.dir, "hero-v2.png")]);
+    assert.ok(fs.existsSync(path.join(sb.dir, "hero-v2.png")));
+    const forced = await runCli(sb, ["generate", "--out", out, "--force", "x"]);
+    assert.deepEqual(savedPaths(forced.stdout), [out]);
+    assert.ok(!fs.existsSync(path.join(sb.dir, "hero-v3.png")));
+  } finally {
+    sb.cleanup();
+  }
+});
+
+test("e2e default out is ./codex-images/<timestamp>-<n>.png and multiple images get numbered", async () => {
+  const sb = makeSandbox();
+  try {
+    const result = await runCli(sb, ["generate", "three variants"], { FAKE_CODEX_IMAGES: "3" });
+    assert.equal(result.status, 0, result.stderr);
+    const saved = savedPaths(result.stdout);
+    assert.equal(saved.length, 3);
+    saved.forEach((file, i) => {
+      assert.equal(path.dirname(fs.realpathSync(file)), fs.realpathSync(path.join(sb.dir, "codex-images")));
+      assert.match(path.basename(file), new RegExp(`^\\d{8}-\\d{6}Z-${i + 1}\\.png$`));
+    });
+  } finally {
+    sb.cleanup();
+  }
+});
+
+test("e2e edit: input must exist, edit instruction reaches codex with --image, edit naming applies", async () => {
+  const sb = makeSandbox();
+  try {
+    const missing = await runCli(sb, ["edit", "nope.png", "make it blue"]);
+    assert.equal(missing.status, 1);
+    assert.match(missing.stderr, /Input image not found/);
+
+    const input = path.join(sb.dir, "in.png");
+    fs.writeFileSync(input, "x");
+    const log = path.join(sb.dir, "args.log");
+    const result = await runCli(sb, ["edit", "in.png", "make it blue"], { FAKE_CODEX_LOG: log });
+    assert.equal(result.status, 0, result.stderr);
+    const [saved] = savedPaths(result.stdout);
+    assert.match(path.basename(saved), /^\d{8}-\d{6}Z-edit-1\.png$/);
+    const argv = JSON.parse(fs.readFileSync(log, "utf8").trim().split("\n")[0]);
+    assert.equal(fs.realpathSync(argv[argv.indexOf("--image") + 1]), fs.realpathSync(input));
+    assert.match(argv[argv.length - 1], /Edit request:\n\nmake it blue$/);
+  } finally {
+    sb.cleanup();
+  }
+});
+
+test("e2e skill mode with a fake codex that saves nothing falls back to the generated file", async () => {
+  const sb = makeSandbox();
+  try {
+    const out = path.join(sb.dir, "skill.png");
+    const log = path.join(sb.dir, "args.log");
+    const result = await runCli(sb, ["generate", "--mode", "skill", "--out", out, "p"], { FAKE_CODEX_LOG: log });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(savedPaths(result.stdout), [out]);
+    assert.match(result.stdout, /USAGE: mode=skill model=account-default effort=medium/);
+    const argv = JSON.parse(fs.readFileSync(log, "utf8").trim().split("\n")[0]);
+    assert.ok(argv.includes('model_reasoning_effort="medium"'));
+    assert.match(argv[argv.length - 1], /^Use the imagegen skill/);
+  } finally {
+    sb.cleanup();
+  }
+});
+
+test("e2e --model and --effort reach codex; invalid effort exits 1 before spawning", async () => {
+  const sb = makeSandbox();
+  try {
+    const log = path.join(sb.dir, "args.log");
+    const ok = await runCli(sb, ["generate", "--model", "gpt-x", "--effort", "high", "--out", path.join(sb.dir, "m.png"), "p"], { FAKE_CODEX_LOG: log });
+    assert.equal(ok.status, 0, ok.stderr);
+    const argv = JSON.parse(fs.readFileSync(log, "utf8").trim().split("\n")[0]);
+    assert.equal(argv[argv.indexOf("-m") + 1], "gpt-x");
+    assert.ok(argv.includes('model_reasoning_effort="high"'));
+    const bad = await runCli(sb, ["generate", "--effort", "minimal", "p"], { FAKE_CODEX_LOG: log });
+    assert.equal(bad.status, 1);
+    assert.equal(fs.readFileSync(log, "utf8").trim().split("\n").length, 1, "codex was not spawned for the bad effort");
+  } finally {
+    sb.cleanup();
+  }
+});
+
+test("e2e batch of 2 with --parallel 2 saves both and reports ITEM lines and a USAGE summary", async () => {
+  const sb = makeSandbox();
+  try {
+    fs.writeFileSync(
+      path.join(sb.dir, "manifest.json"),
+      JSON.stringify([
+        { prompt: "one", out: "b/one.png" },
+        { prompt: "two", out: "b/two.png" }
+      ])
+    );
+    const result = await runCli(sb, ["batch", "manifest.json", "--parallel", "2"]);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(savedPaths(result.stdout).length, 2);
+    assert.ok(fs.existsSync(path.join(sb.dir, "b", "one.png")));
+    assert.ok(fs.existsSync(path.join(sb.dir, "b", "two.png")));
+    assert.match(result.stdout, /^ITEM 1 ok$/m);
+    assert.match(result.stdout, /^ITEM 2 ok$/m);
+    assert.match(result.stdout, /^USAGE: batch items=2 ok=2 secs=\d+/m);
+  } finally {
+    sb.cleanup();
+  }
+});
+
+test("e2e batch: invalid manifest exits 1 before spawning; all-failed exits 1", async () => {
+  const sb = makeSandbox();
+  try {
+    const log = path.join(sb.dir, "args.log");
+    fs.writeFileSync(path.join(sb.dir, "bad.json"), JSON.stringify([{ prompt: "ok" }, { prompt: 5 }]));
+    const bad = await runCli(sb, ["batch", "bad.json"], { FAKE_CODEX_LOG: log });
+    assert.equal(bad.status, 1);
+    assert.match(bad.stderr, /item 2: prompt/);
+    assert.ok(!fs.existsSync(log), "nothing was spawned");
+    fs.writeFileSync(path.join(sb.dir, "m.json"), JSON.stringify([{ prompt: "a" }]));
+    const failed = await runCli(sb, ["batch", "m.json"], { FAKE_CODEX_FAIL: "1" });
+    assert.equal(failed.status, 1);
+    assert.match(failed.stdout, /^ITEM 1 failed /m);
+  } finally {
+    sb.cleanup();
+  }
+});
+
+test("e2e fake codex exiting 1 with no image: exit 1, one-line reason and the stderr tail on stderr, nothing on stdout", async () => {
+  const sb = makeSandbox();
+  try {
+    const result = await runCli(sb, ["generate", "--out", path.join(sb.dir, "x.png"), "p"], { FAKE_CODEX_FAIL: "1" });
+    assert.equal(result.status, 1);
+    assert.equal(result.stdout, "");
+    assert.match(result.stderr, /Error: codex failed: fake codex failure/);
+    assert.match(result.stderr, /fake codex stderr: boom/);
+    assert.ok(!fs.existsSync(path.join(sb.dir, "x.png")));
+  } finally {
+    sb.cleanup();
+  }
+});
+
+test("e2e hard timeout kills a hung codex and fails (CODEX_IMAGE_TIMEOUT_MS)", { skip: process.platform === "win32" }, async () => {
+  const sb = makeSandbox();
+  try {
+    const hang = path.join(sb.dir, "hang-codex.mjs");
+    fs.writeFileSync(hang, "#!/usr/bin/env node\nsetInterval(() => {}, 1000);\n");
+    fs.chmodSync(hang, 0o755);
+    const result = await runCli(sb, ["generate", "p"], { CODEX_IMAGE_CODEX_BIN: hang, CODEX_IMAGE_TIMEOUT_MS: "300" });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /timed out/);
+  } finally {
+    sb.cleanup();
+  }
+});
+
+test("e2e --size 2x2 on macOS: INFO line reports 2x2; non-png out converts or warns", { skip: !isMac }, async () => {
+  const sb = makeSandbox();
+  try {
+    const out = path.join(sb.dir, "small.png");
+    const result = await runCli(sb, ["generate", "--out", out, "--size", "2x2", "p"]);
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, new RegExp(`^INFO: ${out.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} 2x2 alpha=(yes|no) source=.+generated_images.+\\.png$`, "m"));
+    const wide = await runCli(sb, ["generate", "--out", path.join(sb.dir, "wide.png"), "--size", "8x2", "p"]);
+    assert.match(wide.stdout, / 8x2 alpha=/);
+    const jpg = await runCli(sb, ["generate", "--out", path.join(sb.dir, "j.jpg"), "p"]);
+    assert.equal(jpg.status, 0, jpg.stderr);
+    const [saved] = savedPaths(jpg.stdout);
+    assert.match(saved, /\.(jpg|png)$/);
+    assert.ok(fs.existsSync(saved));
+  } finally {
+    sb.cleanup();
+  }
+});
+
+test("main guard runs through a symlink (bin install) and prints usage", { skip: process.platform === "win32" }, async () => {
+  const sb = makeSandbox();
+  try {
+    const link = path.join(sb.dir, "codex-image");
+    fs.symlinkSync(SCRIPT, link);
+    const output = await new Promise((resolve) => {
+      const child = spawn(process.execPath, [link, "--help"], { stdio: ["ignore", "pipe", "pipe"] });
+      let stdout = "";
+      child.stdout.on("data", (chunk) => (stdout += chunk));
+      child.on("close", () => resolve(stdout));
+    });
+    assert.match(output, /Usage: codex-image <command>/);
+  } finally {
+    sb.cleanup();
+  }
 });

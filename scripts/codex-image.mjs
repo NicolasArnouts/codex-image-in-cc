@@ -5,67 +5,36 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 
 const MIN_NODE_VERSION = "18.18.0";
 const MIN_CODEX_VERSION = "0.142.0";
 // Contract cap of the Codex built-in image tool: at most 5 reference images per
 // request (schema-enforced via `referenced_image_paths` since codex 0.144).
 const MAX_REFERENCE_IMAGES = 5;
+const MAX_DIMENSION = 8192;
+const MAX_BATCH_ITEMS = 20;
+const MAX_BATCH_PARALLEL = 3;
+// Under Claude Code's 10-minute Bash cap.
+const DEFAULT_TIMEOUT_MS = 540_000;
+const STDERR_TAIL_CHARS = 4000;
 
-// Image generation is driven by an agent turn (the "orchestrator") that calls the
-// built-in image_gen tool; a stronger orchestrator interprets the prompt, conditions
-// references, and holds the requested aspect more reliably. Rather than hardcode one
-// model — which would break accounts that cannot access it (e.g. ChatGPT Free) — the
-// wrapper queries the account's live model catalog via `codex debug models` and picks
-// the FIRST ladder rung whose model is listed and whose effort that model supports.
-// If the catalog is unavailable or no rung matches, no model/effort is forced and
-// codex falls back to its own config default (the pre-ladder behavior), so this never
-// regresses generation.
-const CODEX_IMAGE_ORCHESTRATOR_LADDER = [
-  { model: "gpt-5.6-luna", effort: "high" },
-  { model: "gpt-5.6-terra", effort: "medium" },
-  { model: "gpt-5.6-sol", effort: "high" },
-  { model: "gpt-5.6-sol", effort: "low" }
-];
-
-// Reasoning efforts codex accepts, used only to validate an explicit env override.
-const CODEX_REASONING_EFFORTS = new Set([
-  "none",
-  "minimal",
-  "low",
-  "medium",
-  "high",
-  "xhigh",
-  "max",
-  "ultra"
-]);
-
-// Explicit override: set BOTH to force a specific orchestrator, bypassing the ladder
-// and the catalog probe (the user is asserting the model is available to them).
-const ORCHESTRATOR_MODEL_ENV = "CODEX_IMAGE_MODEL";
-const ORCHESTRATOR_EFFORT_ENV = "CODEX_IMAGE_EFFORT";
+const IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".webp"];
+const MODES = ["direct", "skill"];
+// minimal / none hard-400 on the image turn, so they are not accepted.
+const VALID_EFFORTS = ["low", "medium", "high", "xhigh", "max", "ultra"];
+const DEFAULT_EFFORT = { direct: "low", skill: "medium" };
 
 // Base headless exec invocation shared by generate and edit.
 //
-// `--full-auto` was the documented headless spelling through Codex CLI 0.14x. 0.144.5
-// deprecated it ("use --sandbox workspace-write instead") and 0.151.0 removed it from
-// `codex exec` outright (`error: unexpected argument '--full-auto' found`, exit 2),
-// which broke every dispatch (#5). `--sandbox workspace-write` is the same sandbox
-// policy `--full-auto` implied and is accepted by every release this plugin supports
-// (verified 0.144.5 and 0.154.0 here, 0.151.0 in #5), so no per-process flag probe is
-// needed.
-//
-// The explicit `-c approval_policy="never"` is load-bearing: bare `--sandbox
-// workspace-write` drops the headless approval-never default when the user's config
-// sets `approvals_reviewer = "auto_review"` (codex-rs build_exec_config rebuilds with
-// approval_policy: None; verified on 0.144.5 and 0.154.0 — the header flips to
-// `approval: on-request`), which would route imagegen's mkdir/cp/sips through the
-// reviewer. `--full-auto` preserved approval-never implicitly; this keeps that
-// contract. `--approve-for-me` (0.153+) is NOT a substitute: it selects the same
-// sandbox but resolves to `approval: on-request` behind the automatic reviewer.
+// `--full-auto` was removed from `codex exec` in 0.151; `--sandbox workspace-write` is the
+// same sandbox policy. The explicit `-c approval_policy="never"` is load-bearing: bare
+// `--sandbox workspace-write` drops the headless approval-never default when the user's
+// config sets `approvals_reviewer = "auto_review"`. `--json` makes stdout a JSONL event
+// stream the wrapper parses (thread id, usage, messages, errors).
 const CODEX_EXEC_BASE_ARGS = [
   "exec",
+  "--json",
   "--sandbox",
   "workspace-write",
   "-c",
@@ -98,7 +67,15 @@ function resolveCodex() {
   return { command: "codex.cmd", prefix: [] };
 }
 
-const CODEX = resolveCodex();
+// Test hook: CODEX_IMAGE_CODEX_BIN is an absolute path to an executable that stands in
+// for codex. Resolved per call (not at import) so tests can set the env late.
+function getCodex(env = process.env) {
+  const override = env.CODEX_IMAGE_CODEX_BIN;
+  if (override && process.platform !== "win32") {
+    return { command: override, prefix: [] };
+  }
+  return resolveCodex();
+}
 
 function parseSemver(text) {
   const match = String(text ?? "").match(/(\d+)\.(\d+)\.(\d+)/);
@@ -128,6 +105,1118 @@ function compareSemver(a, b) {
 function timestampForFile(date = new Date()) {
   return date.toISOString().replace(/\.\d{3}Z$/, "Z").replace(/[-:]/g, "").replace("T", "-");
 }
+
+// ---------------------------------------------------------------------------
+// Home, model, effort, mode resolution
+// ---------------------------------------------------------------------------
+
+// CODEX_IMAGE_HOME > ~/.codex-image (if it exists) > inherited CODEX_HOME > ~/.codex
+function resolveCodexHome({ env = process.env, homedir = os.homedir(), exists = fs.existsSync } = {}) {
+  if (env.CODEX_IMAGE_HOME) {
+    return { path: path.resolve(env.CODEX_IMAGE_HOME), source: "CODEX_IMAGE_HOME", dedicated: false };
+  }
+  const dedicated = path.join(homedir, ".codex-image");
+  if (exists(dedicated)) {
+    return { path: dedicated, source: "~/.codex-image", dedicated: true };
+  }
+  if (env.CODEX_HOME) {
+    return { path: path.resolve(env.CODEX_HOME), source: "CODEX_HOME", dedicated: false };
+  }
+  return { path: path.join(homedir, ".codex"), source: "~/.codex", dedicated: false };
+}
+
+function validateEffort(value, label = "effort") {
+  const effort = String(value ?? "").trim().toLowerCase();
+  if (!VALID_EFFORTS.includes(effort)) {
+    const extra = effort === "minimal" || effort === "none" ? ` (${effort} is rejected by the image turn with HTTP 400)` : "";
+    throw new Error(`Invalid ${label} "${value}"${extra}; expected one of ${VALID_EFFORTS.join("|")}.`);
+  }
+  return effort;
+}
+
+function validateMode(value, label = "mode") {
+  const mode = String(value ?? "").trim().toLowerCase();
+  if (!MODES.includes(mode)) {
+    throw new Error(`Invalid ${label} "${value}"; expected ${MODES.join("|")}.`);
+  }
+  return mode;
+}
+
+function parseSize(value) {
+  const match = String(value ?? "").trim().match(/^(\d+)x(\d+)$/i);
+  const width = match ? Number.parseInt(match[1], 10) : 0;
+  const height = match ? Number.parseInt(match[2], 10) : 0;
+  if (!match || width < 1 || height < 1 || width > MAX_DIMENSION || height > MAX_DIMENSION) {
+    throw new Error(`Invalid size "${value}"; expected <W>x<H> with positive integers up to ${MAX_DIMENSION}.`);
+  }
+  return { width, height };
+}
+
+// Flag > env > default. model has no default (account default => no -m).
+function resolveRunSettings(options = {}, env = process.env) {
+  const mode = validateMode(options.mode || env.CODEX_IMAGE_MODE || "direct", options.mode ? "--mode" : "CODEX_IMAGE_MODE");
+  const effortRaw = options.effort || env.CODEX_IMAGE_EFFORT;
+  const effort = effortRaw
+    ? validateEffort(effortRaw, options.effort ? "--effort" : "CODEX_IMAGE_EFFORT")
+    : DEFAULT_EFFORT[mode];
+  const model = (options.model || env.CODEX_IMAGE_MODEL || "").trim() || null;
+  return { mode, effort, model };
+}
+
+// ---------------------------------------------------------------------------
+// Argument parsing
+// ---------------------------------------------------------------------------
+
+function splitFirstToken(raw) {
+  const text = String(raw ?? "").trim();
+  if (!text) {
+    return { input: null, prompt: null };
+  }
+  const quoted = text.match(/^(['"])((?:\\.|(?!\1).)+)\1(?:\s+([\s\S]+))?$/);
+  if (quoted) {
+    return { input: quoted[2], prompt: (quoted[3] ?? "").trim() };
+  }
+  const unquoted = text.match(/^(\S+)(?:\s+([\s\S]+))?$/);
+  if (unquoted) {
+    return { input: unquoted[1], prompt: (unquoted[2] ?? "").trim() };
+  }
+  return { input: null, prompt: null };
+}
+
+const REFERENCE_IMAGE_FLAGS = new Set(["--ref", "--reference", "--image"]);
+const VALUE_FLAGS = new Set(["--out", "--size", "--mode", "--effort", "--model"]);
+const BOOLEAN_FLAGS = new Set(["--transparent", "--force"]);
+
+// Parse leading flags off `raw`. `kind` is "generate" (reference flags allowed) or
+// "edit". Stops at the first non-flag token (an unknown `--xyz` starts the prompt) or
+// at `--`. Returns { options, rest } where rest is the unparsed remainder.
+function parseLeadingFlags(raw, kind) {
+  let rest = String(raw ?? "").trim();
+  const options = {
+    referenceImages: [],
+    out: null,
+    size: null,
+    transparent: false,
+    mode: null,
+    effort: null,
+    model: null,
+    force: false
+  };
+
+  while (rest) {
+    const first = splitFirstToken(rest);
+    const token = first.input;
+    if (!token) {
+      break;
+    }
+    if (token === "--") {
+      rest = first.prompt ?? "";
+      break;
+    }
+    let name = token;
+    let inlineValue = null;
+    const eq = token.startsWith("--") ? token.indexOf("=") : -1;
+    if (eq > 0) {
+      name = token.slice(0, eq);
+      inlineValue = token.slice(eq + 1);
+    }
+    const isReference = kind === "generate" && REFERENCE_IMAGE_FLAGS.has(name);
+
+    if (BOOLEAN_FLAGS.has(name) && inlineValue === null) {
+      if (name === "--transparent") {
+        options.transparent = true;
+      } else {
+        options.force = true;
+      }
+      rest = first.prompt ?? "";
+      continue;
+    }
+
+    if (isReference || VALUE_FLAGS.has(name)) {
+      let value;
+      let after;
+      if (inlineValue !== null) {
+        value = inlineValue;
+        after = first.prompt ?? "";
+      } else {
+        const next = splitFirstToken(first.prompt ?? "");
+        value = next.input;
+        after = next.prompt ?? "";
+        if (value && value.startsWith("--")) {
+          value = null;
+        }
+      }
+      if (!value) {
+        throw new Error(`Missing value for ${name}.`);
+      }
+      if (isReference) {
+        options.referenceImages.push(value);
+      } else if (name === "--out") {
+        options.out = value;
+      } else if (name === "--size") {
+        options.size = parseSize(value);
+      } else if (name === "--mode") {
+        options.mode = validateMode(value, "--mode");
+      } else if (name === "--effort") {
+        options.effort = validateEffort(value, "--effort");
+      } else if (name === "--model") {
+        options.model = value;
+      }
+      rest = after;
+      continue;
+    }
+
+    break;
+  }
+
+  if (options.referenceImages.length > MAX_REFERENCE_IMAGES) {
+    throw new Error(
+      `Too many reference images (${options.referenceImages.length}). The built-in image generation tool accepts at most ${MAX_REFERENCE_IMAGES} per request — pass the ${MAX_REFERENCE_IMAGES} most relevant.`
+    );
+  }
+  return { options, rest: rest.trim() };
+}
+
+function parseGenerateArguments(raw) {
+  const { options, rest } = parseLeadingFlags(raw, "generate");
+  return { ...options, prompt: rest };
+}
+
+// edit [flags] <input> <prompt>
+function parseEditArguments(raw) {
+  const { options, rest } = parseLeadingFlags(raw, "edit");
+  const { input, prompt } = splitFirstToken(rest);
+  return { ...options, input: input ?? null, prompt: prompt ?? "" };
+}
+
+// Split a raw argument string into tokens (quotes supported) for `batch`.
+function tokenize(raw) {
+  const tokens = [];
+  let rest = String(raw ?? "").trim();
+  while (rest) {
+    const { input, prompt } = splitFirstToken(rest);
+    if (!input) {
+      break;
+    }
+    tokens.push(input);
+    rest = prompt ?? "";
+  }
+  return tokens;
+}
+
+function parseBatchArguments(raw) {
+  const tokens = tokenize(raw);
+  const options = { manifest: null, mode: null, effort: null, model: null, parallel: 1 };
+  for (let index = 0; index < tokens.length; index += 1) {
+    let name = tokens[index];
+    let inlineValue = null;
+    const eq = name.startsWith("--") ? name.indexOf("=") : -1;
+    if (eq > 0) {
+      inlineValue = name.slice(eq + 1);
+      name = name.slice(0, eq);
+    }
+    if (["--mode", "--effort", "--model", "--parallel"].includes(name)) {
+      let value = inlineValue;
+      if (value === null) {
+        value = tokens[index + 1];
+        index += 1;
+      }
+      if (!value || value.startsWith("--")) {
+        throw new Error(`Missing value for ${name}.`);
+      }
+      if (name === "--mode") {
+        options.mode = validateMode(value, "--mode");
+      } else if (name === "--effort") {
+        options.effort = validateEffort(value, "--effort");
+      } else if (name === "--model") {
+        options.model = value;
+      } else {
+        const parallel = Number.parseInt(value, 10);
+        if (!/^\d+$/.test(value) || parallel < 1 || parallel > MAX_BATCH_PARALLEL) {
+          throw new Error(`Invalid --parallel "${value}"; expected an integer 1-${MAX_BATCH_PARALLEL}.`);
+        }
+        options.parallel = parallel;
+      }
+      continue;
+    }
+    if (name.startsWith("--")) {
+      throw new Error(`Unknown batch option ${name}.`);
+    }
+    if (options.manifest) {
+      throw new Error(`Unexpected extra argument "${name}".`);
+    }
+    options.manifest = name;
+  }
+  return options;
+}
+
+function resolveExistingImagePaths(inputs, cwd, label) {
+  return inputs.map((input) => {
+    const resolved = path.resolve(cwd, input);
+    if (!fs.existsSync(resolved)) {
+      throw new Error(`${label} image not found: ${resolved}`);
+    }
+    return resolved;
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Out-path planning
+// ---------------------------------------------------------------------------
+
+function hasImageExtension(file) {
+  return IMAGE_EXTENSIONS.includes(path.extname(String(file)).toLowerCase());
+}
+
+// `--out` ending in an image extension is a file; anything else is a directory.
+// Omitted: <cwd>/codex-images/.
+function resolveOutTarget(out, cwd) {
+  if (!out) {
+    return { kind: "dir", path: path.resolve(cwd, "codex-images"), dir: path.resolve(cwd, "codex-images") };
+  }
+  const resolved = path.resolve(cwd, out);
+  if (hasImageExtension(resolved)) {
+    return { kind: "file", path: resolved, dir: path.dirname(resolved) };
+  }
+  return { kind: "dir", path: resolved, dir: resolved };
+}
+
+// hero.png exists -> hero-v2.png, then hero-v3.png ...
+function versionedPath(file, exists = fs.existsSync) {
+  if (!exists(file)) {
+    return file;
+  }
+  const ext = path.extname(file);
+  const stem = file.slice(0, file.length - ext.length);
+  for (let version = 2; ; version += 1) {
+    const candidate = `${stem}-v${version}${ext}`;
+    if (!exists(candidate)) {
+      return candidate;
+    }
+  }
+}
+
+// Destination files for `count` images. Never overwrites unless force.
+function planDestinations({ target, count, edit = false, timestamp = timestampForFile(), force = false, exists = fs.existsSync }) {
+  const pick = (file) => (force ? file : versionedPath(file, exists));
+  const destinations = [];
+  if (target.kind === "file") {
+    if (count <= 1) {
+      return [pick(target.path)];
+    }
+    const ext = path.extname(target.path);
+    const stem = target.path.slice(0, target.path.length - ext.length);
+    for (let index = 1; index <= count; index += 1) {
+      destinations.push(pick(`${stem}-${index}${ext}`));
+    }
+    return destinations;
+  }
+  for (let index = 1; index <= count; index += 1) {
+    const name = `${timestamp}-${edit ? "edit-" : ""}${index}.png`;
+    // Directory defaults are always versioned (a same-second rerun must not overwrite).
+    destinations.push(versionedPath(path.join(target.path, name), exists));
+  }
+  return destinations;
+}
+
+// ---------------------------------------------------------------------------
+// Instructions (pure)
+// ---------------------------------------------------------------------------
+
+function transparentHint(transparent) {
+  return transparent
+    ? "Set transparent_background to true."
+    : "Set transparent_background to true only if the request asks for transparency.";
+}
+
+function sizeHint(size) {
+  return size ? `The caller will crop/resize to ${size.width}x${size.height}, so compose for a ${size.width}:${size.height} aspect ratio.` : "";
+}
+
+function joinParagraphs(parts) {
+  return parts.filter(Boolean).join("\n");
+}
+
+function buildDirectGenerateInstruction({ prompt, referenceImagePaths = [], transparent = false, size = null }) {
+  const refs = referenceImagePaths.length
+    ? `Pass these absolute paths as referenced_image_paths:\n${referenceImagePaths.join("\n")}\nThey are references, not edit targets.`
+    : "";
+  return `${joinParagraphs([
+    "Generate the image(s) with your built-in image generation tool (image_gen.imagegen). Do not read skill files or any other files, do not run shell commands, and do not copy, move or resize anything: the caller handles files.",
+    `Pass the request below as the prompt unchanged. ${transparentHint(transparent)}`,
+    refs,
+    sizeHint(size),
+    "If the request asks for several images or variants, call the tool once per image.",
+    "When the tool has finished, reply with exactly one line: DONE."
+  ])}
+
+Request:
+
+${prompt}`;
+}
+
+function buildDirectEditInstruction({ inputPath, prompt, transparent = false, size = null }) {
+  return `${joinParagraphs([
+    `Edit the image at ${inputPath} with your built-in image generation tool (pass it in referenced_image_paths). Preserve everything the request does not ask to change.`,
+    "Do not read skill files or any other files, do not run shell commands, and do not copy, move or resize anything: the caller handles files.",
+    `Pass the request below as the prompt unchanged. ${transparentHint(transparent)}`,
+    sizeHint(size),
+    "If the request asks for several images or variants, call the tool once per image.",
+    "When the tool has finished, reply with exactly one line: DONE."
+  ])}
+
+Edit request:
+
+${prompt}`;
+}
+
+function formatReferenceImages(referenceImagePaths) {
+  if (referenceImagePaths.length === 0) {
+    return "";
+  }
+  const lines = referenceImagePaths.map((imagePath, index) => `${index + 1}. ${imagePath}`);
+  return `\nReference images for generation (also attached to this turn via codex exec --image):\n${lines.join("\n")}\n\nThese are generation references, not edit targets. If your built-in image generation tool accepts local image paths (codex 0.144+, referenced_image_paths), pass the absolute paths above so the reference pixels condition the output directly; otherwise use the attachments as visual context for style, identity, composition, mood, or subject guidance according to the user's prompt. Do not modify or overwrite the referenced files.\n`;
+}
+
+function skillSaveParagraph(outTarget, edit) {
+  const where =
+    outTarget.kind === "file"
+      ? outTarget.path
+      : `${outTarget.path} (name files <UTC-timestamp>-${edit ? "edit-" : ""}<n>.png, n=1,2,... per image)`;
+  return `Save the final image(s) to ${where} (create no other copies).\n\nFor each saved image, print exactly one line:\nSAVED: <absolute path>`;
+}
+
+function skillHints({ transparent, size }) {
+  const parts = [];
+  if (transparent) {
+    parts.push("The image must have a transparent background.");
+  }
+  if (size) {
+    parts.push(`The caller will crop/resize to ${size.width}x${size.height}, so compose for a ${size.width}:${size.height} aspect ratio.`);
+  }
+  return parts.length ? `\n${parts.join("\n")}\n` : "";
+}
+
+function buildSkillGenerateInstruction({ prompt, referenceImagePaths = [], outTarget, transparent = false, size = null }) {
+  return `Use the imagegen skill. Built-in image_gen tool path only — do not use the CLI fallback (no OPENAI_API_KEY required).
+
+${skillSaveParagraph(outTarget, false)}
+${skillHints({ transparent, size })}${formatReferenceImages(referenceImagePaths)}
+User request:
+
+${prompt}`;
+}
+
+function buildSkillEditInstruction({ inputPath, prompt, outTarget, transparent = false, size = null }) {
+  return `Use the imagegen skill. Built-in image_gen tool path only — do not use the CLI fallback (no OPENAI_API_KEY required).
+
+The edit target image (also attached to this turn via codex exec --image):
+${inputPath}
+
+If your built-in image generation tool accepts local image paths (codex 0.144+, referenced_image_paths), pass the absolute path above as the edit reference. Preserve unrelated parts unless the user request says otherwise.
+
+${skillSaveParagraph(outTarget, true)}
+${skillHints({ transparent, size })}
+User edit request:
+
+${prompt}`;
+}
+
+// Dispatchers used by the job runner and tests.
+function buildGenerateInstruction({ mode = "direct", ...rest }) {
+  return mode === "skill" ? buildSkillGenerateInstruction(rest) : buildDirectGenerateInstruction(rest);
+}
+
+function buildEditInstruction({ mode = "direct", ...rest }) {
+  return mode === "skill" ? buildSkillEditInstruction(rest) : buildDirectEditInstruction(rest);
+}
+
+// Absolute image paths mentioned in a prompt -> nearest EXISTING ancestor dir of each
+// (deduped, never "/"), so skill mode (which writes files itself) can read/write there.
+function extractPromptAddDirs(prompt, exists = fs.existsSync) {
+  const dirs = new Set();
+  const pattern = /(?:^|[\s"'`(\[])(\/[^\s"'`()<>\[\]]+?\.(?:png|jpe?g|webp|gif))(?=$|[\s"'`)\],.;:])/gi;
+  for (const match of String(prompt ?? "").matchAll(pattern)) {
+    let dir = path.dirname(match[1]);
+    while (dir && dir !== "/" && dir !== path.dirname(dir) && !exists(dir)) {
+      dir = path.dirname(dir);
+    }
+    if (dir && dir !== "/" && exists(dir)) {
+      dirs.add(dir);
+    }
+  }
+  return [...dirs];
+}
+
+// codex exec argv for one image turn.
+function buildCodexArgs({ cwd, effort, model = null, images = [], addDirs = [], lastMessageFile, instruction }) {
+  const args = [...CODEX_EXEC_BASE_ARGS, "-c", `model_reasoning_effort=${JSON.stringify(effort)}`];
+  if (model) {
+    args.push("-m", model);
+  }
+  for (const image of images) {
+    args.push("--image", image);
+  }
+  args.push("-C", cwd);
+  for (const dir of [...new Set(addDirs)]) {
+    args.push("--add-dir", dir);
+  }
+  if (lastMessageFile) {
+    args.push("-o", lastMessageFile);
+  }
+  args.push("--", instruction);
+  return args;
+}
+
+// ---------------------------------------------------------------------------
+// JSONL event stream
+// ---------------------------------------------------------------------------
+
+function createEventState() {
+  return {
+    threadId: null,
+    messages: [],
+    warnings: [],
+    failures: [],
+    usage: { input: 0, cached: 0, output: 0 }
+  };
+}
+
+function parseJsonLine(line) {
+  const text = String(line ?? "").trim();
+  if (!text.startsWith("{")) {
+    return null;
+  }
+  try {
+    const value = JSON.parse(text);
+    return value && typeof value === "object" ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+// Apply one parsed event to `state`; return progress messages (strings) to print.
+function applyCodexEvent(state, event) {
+  const progress = [];
+  if (!event || typeof event.type !== "string") {
+    return progress;
+  }
+  if (event.type === "thread.started" && typeof event.thread_id === "string") {
+    state.threadId = event.thread_id;
+    progress.push(`thread ${event.thread_id} started`);
+  } else if (event.type === "item.completed" && event.item) {
+    const item = event.item;
+    if (item.type === "agent_message" && typeof item.text === "string") {
+      state.messages.push(item.text);
+      progress.push(`codex: ${item.text.replace(/\s+/g, " ").slice(0, 200)}`);
+    } else if (item.type === "error" && typeof item.message === "string") {
+      if (!state.warnings.includes(item.message)) {
+        state.warnings.push(item.message);
+        progress.push(`warning: ${item.message.replace(/\s+/g, " ").slice(0, 160)}`);
+      }
+    }
+  } else if (event.type === "turn.completed" && event.usage) {
+    state.usage.input += Number(event.usage.input_tokens) || 0;
+    state.usage.cached += Number(event.usage.cached_input_tokens) || 0;
+    state.usage.output += Number(event.usage.output_tokens) || 0;
+  } else if (event.type === "turn.failed" || event.type === "error") {
+    const message = event.error?.message ?? event.message ?? "codex turn failed";
+    state.failures.push(String(message));
+    progress.push(`error: ${String(message).replace(/\s+/g, " ").slice(0, 200)}`);
+  }
+  return progress;
+}
+
+// Parse a whole JSONL text (fixtures, tests).
+function parseCodexJsonl(text) {
+  const state = createEventState();
+  for (const line of String(text ?? "").split(/\r?\n/)) {
+    applyCodexEvent(state, parseJsonLine(line));
+  }
+  return state;
+}
+
+// ---------------------------------------------------------------------------
+// Spawn
+// ---------------------------------------------------------------------------
+
+function timeoutMs(env = process.env) {
+  const value = Number.parseInt(env.CODEX_IMAGE_TIMEOUT_MS ?? "", 10);
+  return Number.isFinite(value) && value > 0 ? value : DEFAULT_TIMEOUT_MS;
+}
+
+// Run one codex turn. stdin is ignored (the stdin trap), stdout is parsed as JSONL,
+// stderr is drained into a bounded tail. Resolves { status, timedOut, state, stderrTail }.
+function runCodexTurn({ args, cwd, home, label = "", onProgress }) {
+  return new Promise((resolve, reject) => {
+    const codex = getCodex();
+    const state = createEventState();
+    const prefix = label ? `codex-image: [${label}] ` : "codex-image: ";
+    const emit = onProgress ?? ((message) => process.stderr.write(`${prefix}${message}\n`));
+    let stderrTail = "";
+    let carry = "";
+    let timedOut = false;
+    let killTimer = null;
+
+    const child = spawn(codex.command, [...codex.prefix, ...args], {
+      cwd,
+      env: { ...process.env, CODEX_HOME: home },
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true
+    });
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      const lines = (carry + chunk).split("\n");
+      carry = lines.pop();
+      for (const line of lines) {
+        for (const message of applyCodexEvent(state, parseJsonLine(line))) {
+          emit(message);
+        }
+      }
+    });
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk) => {
+      stderrTail = (stderrTail + chunk).slice(-STDERR_TAIL_CHARS);
+    });
+
+    const limit = timeoutMs();
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGTERM");
+      killTimer = setTimeout(() => child.kill("SIGKILL"), 5000);
+    }, limit);
+
+    child.on("error", (error) => {
+      clearTimeout(timer);
+      clearTimeout(killTimer);
+      reject(error);
+    });
+    child.on("close", (status, signal) => {
+      clearTimeout(timer);
+      clearTimeout(killTimer);
+      for (const message of applyCodexEvent(state, parseJsonLine(carry))) {
+        emit(message);
+      }
+      resolve({ status: status ?? (signal ? 1 : 0), timedOut, timeoutMs: limit, state, stderrTail });
+    });
+  });
+}
+
+// ---------------------------------------------------------------------------
+// sips (macOS) helpers
+// ---------------------------------------------------------------------------
+
+let sipsAvailable = null;
+function hasSips() {
+  if (sipsAvailable === null) {
+    if (process.platform !== "darwin") {
+      sipsAvailable = false;
+    } else {
+      const result = spawnSync("sips", ["--help"], { stdio: "pipe", encoding: "utf8" });
+      sipsAvailable = !(result.error && result.error.code === "ENOENT");
+    }
+  }
+  return sipsAvailable;
+}
+
+function sipsInfo(file) {
+  const result = spawnSync("sips", ["-g", "pixelWidth", "-g", "pixelHeight", "-g", "hasAlpha", file], {
+    encoding: "utf8",
+    stdio: "pipe"
+  });
+  if (result.status !== 0) {
+    return null;
+  }
+  const width = Number.parseInt(result.stdout.match(/pixelWidth:\s*(\d+)/)?.[1] ?? "", 10);
+  const height = Number.parseInt(result.stdout.match(/pixelHeight:\s*(\d+)/)?.[1] ?? "", 10);
+  const alpha = result.stdout.match(/hasAlpha:\s*(\w+)/)?.[1] ?? "no";
+  if (!width || !height) {
+    return null;
+  }
+  return { width, height, alpha: alpha.toLowerCase() === "yes" };
+}
+
+// Scale to COVER the target, then center-crop to exactly W x H.
+function applySize(file, size) {
+  const info = sipsInfo(file);
+  if (!info) {
+    return false;
+  }
+  if (info.width === size.width && info.height === size.height) {
+    return true;
+  }
+  const factor = Math.max(size.width / info.width, size.height / info.height);
+  const scaledWidth = Math.max(size.width, Math.ceil(info.width * factor));
+  const scaledHeight = Math.max(size.height, Math.ceil(info.height * factor));
+  const resample = spawnSync("sips", ["--resampleHeightWidth", String(scaledHeight), String(scaledWidth), file], { stdio: "pipe" });
+  if (resample.status !== 0) {
+    return false;
+  }
+  const crop = spawnSync("sips", ["--cropToHeightWidth", String(size.height), String(size.width), file], { stdio: "pipe" });
+  return crop.status === 0;
+}
+
+function convertImage(source, destination) {
+  const ext = path.extname(destination).toLowerCase();
+  const format = ext === ".webp" ? "webp" : "jpeg";
+  const result = spawnSync("sips", ["-s", "format", format, source, "--out", destination], { stdio: "pipe" });
+  return result.status === 0 && fs.existsSync(destination);
+}
+
+// ---------------------------------------------------------------------------
+// Collect and finalize
+// ---------------------------------------------------------------------------
+
+function listImagesIn(dir) {
+  let entries;
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const files = [];
+  for (const entry of entries) {
+    const full = path.join(dir, entry.name);
+    if (entry.isFile() && hasImageExtension(full)) {
+      files.push({ path: full, mtimeMs: fs.statSync(full).mtimeMs });
+    }
+  }
+  return files;
+}
+
+// Files codex generated for this turn, oldest first.
+function collectGeneratedImages(home, threadId, sinceMs) {
+  const root = path.join(home, "generated_images");
+  let files;
+  if (threadId) {
+    files = listImagesIn(path.join(root, threadId));
+  } else {
+    files = [];
+    let dirs = [];
+    try {
+      dirs = fs.readdirSync(root, { withFileTypes: true }).filter((entry) => entry.isDirectory());
+    } catch {
+      dirs = [];
+    }
+    for (const dir of dirs) {
+      files.push(...listImagesIn(path.join(root, dir.name)).filter((file) => file.mtimeMs >= sinceMs));
+    }
+  }
+  return files.sort((a, b) => a.mtimeMs - b.mtimeMs || a.path.localeCompare(b.path)).map((file) => file.path);
+}
+
+function parseSavedLines(text) {
+  const paths = [];
+  for (const match of String(text ?? "").matchAll(/^\s*SAVED:\s*(.+?)\s*$/gm)) {
+    paths.push(match[1]);
+  }
+  return paths;
+}
+
+// Skill-mode results: files the Codex turn itself saved (out file, or SAVED: lines),
+// only if modified after the turn started.
+function collectSkillResults({ outTarget, plannedOut, lastText, sinceMs }) {
+  const fresh = (file) => {
+    try {
+      return fs.statSync(file).mtimeMs >= sinceMs - 2000;
+    } catch {
+      return false;
+    }
+  };
+  const results = [];
+  if (outTarget.kind === "file" && fresh(plannedOut)) {
+    results.push(plannedOut);
+  }
+  for (const saved of parseSavedLines(lastText)) {
+    const abs = path.resolve(saved);
+    if (!results.includes(abs) && fresh(abs)) {
+      results.push(abs);
+    }
+  }
+  return results;
+}
+
+// Copy generated files to their destinations (mkdir -p, optional format conversion).
+function copyGenerated({ generated, destinations, warnings }) {
+  const finals = [];
+  generated.forEach((source, index) => {
+    let destination = destinations[index];
+    fs.mkdirSync(path.dirname(destination), { recursive: true });
+    const ext = path.extname(destination).toLowerCase();
+    const sourceIsPng = path.extname(source).toLowerCase() === ".png";
+    if (ext !== ".png" && sourceIsPng) {
+      if (hasSips() && convertImage(source, destination)) {
+        finals.push({ path: destination, source });
+        return;
+      }
+      const fallback = versionedPath(`${destination.slice(0, destination.length - ext.length)}.png`);
+      warnings.push(`could not convert to ${ext}; kept png at ${fallback}`);
+      destination = fallback;
+    }
+    fs.copyFileSync(source, destination);
+    finals.push({ path: destination, source });
+  });
+  return finals;
+}
+
+// ---------------------------------------------------------------------------
+// One image job (generate / edit)
+// ---------------------------------------------------------------------------
+
+// job: { kind: "generate"|"edit", prompt, referenceImagePaths, inputPath, out, size,
+//        transparent, mode, effort, model, force, cwd, label }
+// Returns { ok, reason, stderrTail, lines: [stdout lines], saved, usageLine, warnings }.
+async function runImageJob(job, { onProgress } = {}) {
+  const cwd = job.cwd ?? process.cwd();
+  const settings = resolveRunSettings(job);
+  const home = resolveCodexHome().path;
+  const edit = job.kind === "edit";
+  const outTarget = resolveOutTarget(job.out, cwd);
+  fs.mkdirSync(outTarget.dir, { recursive: true });
+  const warnings = [];
+
+  let plannedOut = outTarget.path;
+  if (settings.mode === "skill" && outTarget.kind === "file" && !job.force) {
+    plannedOut = versionedPath(outTarget.path);
+  }
+  const skillTarget = { ...outTarget, path: plannedOut };
+  const common = { prompt: job.prompt, transparent: Boolean(job.transparent), size: job.size ?? null };
+  const instruction = edit
+    ? buildEditInstruction({ mode: settings.mode, inputPath: job.inputPath, outTarget: skillTarget, ...common })
+    : buildGenerateInstruction({
+        mode: settings.mode,
+        referenceImagePaths: job.referenceImagePaths ?? [],
+        outTarget: skillTarget,
+        ...common
+      });
+
+  const addDirs = [outTarget.dir];
+  if (settings.mode === "skill") {
+    addDirs.push(...extractPromptAddDirs(job.prompt));
+  }
+  const images = edit ? [job.inputPath] : job.referenceImagePaths ?? [];
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-image-"));
+  const lastMessageFile = path.join(tmpDir, "last-message.txt");
+  const args = buildCodexArgs({
+    cwd,
+    effort: settings.effort,
+    model: settings.model,
+    images,
+    addDirs,
+    lastMessageFile,
+    instruction
+  });
+
+  const startMs = Date.now();
+  let turn;
+  try {
+    turn = await runCodexTurn({ args, cwd, home, label: job.label, onProgress });
+  } catch (error) {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    return { ok: false, reason: `could not run codex: ${error.message}`, stderrTail: "", lines: [], saved: [], warnings };
+  }
+  let lastText = turn.state.messages.join("\n");
+  try {
+    lastText += `\n${fs.readFileSync(lastMessageFile, "utf8")}`;
+  } catch {
+    // codex did not write the last-message file
+  }
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+
+  const generated = collectGeneratedImages(home, turn.state.threadId, startMs - 2000);
+  let finals = [];
+  if (settings.mode === "skill") {
+    const results = collectSkillResults({ outTarget, plannedOut, lastText, sinceMs: startMs });
+    finals = results.map((file, index) => ({ path: file, source: generated[index] ?? "unknown" }));
+  }
+  if (finals.length === 0 && generated.length > 0) {
+    const destinations = planDestinations({
+      target: outTarget,
+      count: generated.length,
+      edit,
+      force: Boolean(job.force)
+    });
+    finals = copyGenerated({ generated, destinations, warnings });
+  }
+
+  if (finals.length === 0) {
+    let reason;
+    if (turn.timedOut) {
+      reason = `codex timed out after ${Math.round(turn.timeoutMs / 1000)}s`;
+    } else if (turn.state.failures.length > 0) {
+      reason = `codex failed: ${turn.state.failures[turn.state.failures.length - 1].slice(0, 300)}`;
+    } else if (turn.status !== 0) {
+      reason = `codex exited with status ${turn.status} and produced no image`;
+    } else {
+      reason = "codex finished but produced no image";
+    }
+    return { ok: false, reason, stderrTail: turn.stderrTail, lines: [], saved: [], warnings };
+  }
+  if (turn.status !== 0 || turn.timedOut) {
+    warnings.push(`codex exited with status ${turn.status}${turn.timedOut ? " (timed out)" : ""} but ${finals.length} image(s) were generated; saved them`);
+  }
+
+  const sips = hasSips();
+  const lines = [];
+  for (const final of finals) {
+    if (job.size) {
+      if (sips) {
+        if (!applySize(final.path, job.size)) {
+          warnings.push(`size not applied to ${final.path} (sips failed)`);
+        }
+      } else {
+        warnings.push("size not applied (sips not available)");
+      }
+    }
+    lines.push(`SAVED: ${final.path}`);
+    if (sips) {
+      const info = sipsInfo(final.path);
+      if (info) {
+        lines.push(`INFO: ${final.path} ${info.width}x${info.height} alpha=${info.alpha ? "yes" : "no"} source=${final.source}`);
+      }
+    }
+  }
+  const usage = turn.state.usage;
+  const secs = Math.round((Date.now() - startMs) / 1000);
+  const usageLine = `USAGE: mode=${settings.mode} model=${settings.model ?? "account-default"} effort=${settings.effort} secs=${secs} input=${usage.input} cached=${usage.cached} output=${usage.output} thread=${turn.state.threadId ?? "unknown"}`;
+  return { ok: true, lines, saved: finals, usageLine, warnings, stderrTail: turn.stderrTail };
+}
+
+function reportFailure(result) {
+  console.error(`Error: ${result.reason}`);
+  if (result.stderrTail && result.stderrTail.trim()) {
+    console.error(result.stderrTail.trim());
+  }
+}
+
+async function handleImageCommand(kind, argv) {
+  const raw = (argv.join(" ") || "").trim();
+  const cwd = process.cwd();
+  let parsed;
+  let job;
+  try {
+    parsed = kind === "edit" ? parseEditArguments(raw) : parseGenerateArguments(raw);
+  } catch (error) {
+    console.error(`Error: ${error.message}`);
+    process.exitCode = 1;
+    return;
+  }
+  if (!parsed.prompt || (kind === "edit" && !parsed.input)) {
+    console.error(
+      kind === "edit"
+        ? "Usage: /codex-image:edit [flags] <input-path> <edit instructions>"
+        : "Usage: /codex-image:generate [flags] [--ref <reference-image> ...] <natural-language image request>"
+    );
+    process.exitCode = 1;
+    return;
+  }
+  try {
+    resolveRunSettings(parsed);
+    job = {
+      kind,
+      prompt: parsed.prompt,
+      out: parsed.out,
+      size: parsed.size,
+      transparent: parsed.transparent,
+      mode: parsed.mode,
+      effort: parsed.effort,
+      model: parsed.model,
+      force: parsed.force,
+      cwd
+    };
+    if (kind === "edit") {
+      job.inputPath = resolveExistingImagePaths([parsed.input], cwd, "Input")[0];
+    } else {
+      job.referenceImagePaths = resolveExistingImagePaths(parsed.referenceImages, cwd, "Reference");
+    }
+  } catch (error) {
+    console.error(`Error: ${error.message}`);
+    process.exitCode = 1;
+    return;
+  }
+  const result = await runImageJob(job);
+  for (const warning of result.warnings ?? []) {
+    console.error(`codex-image: warning: ${warning}`);
+  }
+  if (!result.ok) {
+    reportFailure(result);
+    process.exitCode = 1;
+    return;
+  }
+  for (const line of result.lines) {
+    console.log(line);
+  }
+  console.log(result.usageLine);
+}
+
+// ---------------------------------------------------------------------------
+// batch
+// ---------------------------------------------------------------------------
+
+// Validate the whole manifest before anything is spawned. Relative paths resolve
+// against the manifest's directory. Returns normalized jobs.
+function parseBatchManifest(text, baseDir, exists = fs.existsSync) {
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch (error) {
+    throw new Error(`Manifest is not valid JSON: ${error.message}`);
+  }
+  if (!Array.isArray(data) || data.length === 0) {
+    throw new Error("Manifest must be a non-empty JSON array.");
+  }
+  if (data.length > MAX_BATCH_ITEMS) {
+    throw new Error(`Manifest has ${data.length} items; the maximum is ${MAX_BATCH_ITEMS}.`);
+  }
+  const problems = [];
+  const jobs = data.map((item, index) => {
+    const n = index + 1;
+    const fail = (message) => problems.push(`item ${n}: ${message}`);
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      fail("must be an object");
+      return null;
+    }
+    const known = new Set(["prompt", "out", "refs", "edit", "size", "transparent", "force"]);
+    for (const key of Object.keys(item)) {
+      if (!known.has(key)) {
+        fail(`unknown field "${key}"`);
+      }
+    }
+    if (typeof item.prompt !== "string" || !item.prompt.trim()) {
+      fail("prompt must be a non-empty string");
+    }
+    if (item.out !== undefined && (typeof item.out !== "string" || !item.out)) {
+      fail("out must be a non-empty string");
+    }
+    for (const key of ["transparent", "force"]) {
+      if (item[key] !== undefined && typeof item[key] !== "boolean") {
+        fail(`${key} must be a boolean`);
+      }
+    }
+    let size = null;
+    if (item.size !== undefined) {
+      try {
+        size = parseSize(item.size);
+      } catch (error) {
+        fail(error.message);
+      }
+    }
+    const referenceImagePaths = [];
+    if (item.refs !== undefined) {
+      if (!Array.isArray(item.refs) || item.refs.some((ref) => typeof ref !== "string" || !ref)) {
+        fail("refs must be an array of paths");
+      } else if (item.refs.length > MAX_REFERENCE_IMAGES) {
+        fail(`at most ${MAX_REFERENCE_IMAGES} refs`);
+      } else {
+        for (const ref of item.refs) {
+          const abs = path.resolve(baseDir, ref);
+          if (!exists(abs)) {
+            fail(`reference image not found: ${abs}`);
+          }
+          referenceImagePaths.push(abs);
+        }
+      }
+    }
+    let inputPath = null;
+    if (item.edit !== undefined) {
+      if (typeof item.edit !== "string" || !item.edit) {
+        fail("edit must be an input image path");
+      } else {
+        inputPath = path.resolve(baseDir, item.edit);
+        if (!exists(inputPath)) {
+          fail(`input image not found: ${inputPath}`);
+        }
+        if (referenceImagePaths.length > 0) {
+          fail("refs cannot be combined with edit");
+        }
+      }
+    }
+    return {
+      kind: inputPath ? "edit" : "generate",
+      prompt: typeof item.prompt === "string" ? item.prompt.trim() : "",
+      out: typeof item.out === "string" ? path.resolve(baseDir, item.out) : null,
+      referenceImagePaths,
+      inputPath,
+      size,
+      transparent: item.transparent === true,
+      force: item.force === true
+    };
+  });
+  if (problems.length > 0) {
+    throw new Error(`Invalid manifest:\n${problems.map((problem) => `- ${problem}`).join("\n")}`);
+  }
+  return jobs;
+}
+
+async function handleBatch(argv) {
+  let options;
+  let jobs;
+  let settingsCheck;
+  try {
+    options = parseBatchArguments(argv.join(" "));
+    if (!options.manifest) {
+      throw new Error("Usage: /codex-image:batch <manifest.json> [--mode m] [--effort e] [--model s] [--parallel N]");
+    }
+    settingsCheck = resolveRunSettings(options);
+    const manifestPath = path.resolve(process.cwd(), options.manifest);
+    if (!fs.existsSync(manifestPath)) {
+      throw new Error(`Manifest not found: ${manifestPath}`);
+    }
+    jobs = parseBatchManifest(fs.readFileSync(manifestPath, "utf8"), path.dirname(manifestPath));
+  } catch (error) {
+    console.error(`Error: ${error.message}`);
+    process.exitCode = 1;
+    return;
+  }
+  const started = Date.now();
+  const results = new Array(jobs.length).fill(null);
+  let next = 0;
+  const worker = async () => {
+    while (next < jobs.length) {
+      const index = next;
+      next += 1;
+      const job = {
+        ...jobs[index],
+        mode: options.mode,
+        effort: options.effort,
+        model: options.model,
+        cwd: process.cwd(),
+        label: String(index + 1)
+      };
+      let result;
+      try {
+        result = await runImageJob(job);
+      } catch (error) {
+        result = { ok: false, reason: error.message, lines: [], warnings: [] };
+      }
+      results[index] = result;
+      for (const warning of result.warnings ?? []) {
+        console.error(`codex-image: [${index + 1}] warning: ${warning}`);
+      }
+      if (result.ok) {
+        for (const line of result.lines) {
+          console.log(line);
+        }
+        console.log(`ITEM ${index + 1} ok`);
+      } else {
+        console.error(`codex-image: [${index + 1}] ${result.reason}`);
+        if (result.stderrTail?.trim()) {
+          console.error(result.stderrTail.trim());
+        }
+        console.log(`ITEM ${index + 1} failed ${result.reason}`);
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(options.parallel, jobs.length) }, worker));
+  const ok = results.filter((result) => result?.ok).length;
+  const secs = Math.round((Date.now() - started) / 1000);
+  console.log(`USAGE: batch items=${jobs.length} ok=${ok} secs=${secs} mode=${settingsCheck.mode} effort=${settingsCheck.effort}`);
+  process.exitCode = ok === jobs.length ? 0 : ok === 0 ? 1 : 2;
+}
+
+// ---------------------------------------------------------------------------
+// status
+// ---------------------------------------------------------------------------
 
 function parseStatusOptions(argv) {
   const options = {};
@@ -164,7 +1253,7 @@ function resolveCwd(options) {
 function runSync(command, args, options = {}) {
   const result = spawnSync(command, args, {
     cwd: options.cwd,
-    env: process.env,
+    env: options.env ?? process.env,
     encoding: "utf8",
     input: options.input,
     stdio: "pipe",
@@ -191,314 +1280,59 @@ function firstLine(text) {
   return String(text ?? "").trim().split(/\r?\n/)[0] ?? "";
 }
 
-function findImagegenSkill() {
-  const codexHome = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
-  const candidate = path.join(codexHome, "skills", ".system", "imagegen", "SKILL.md");
+function findImagegenSkill(home) {
+  const candidate = path.join(home, "skills", ".system", "imagegen", "SKILL.md");
   return fs.existsSync(candidate) ? candidate : null;
-}
-
-// ---------------------------------------------------------------------------
-// Image orchestrator selection (model + reasoning effort)
-// ---------------------------------------------------------------------------
-
-// Parse `codex debug models` JSON into slug -> Set(supported efforts), keeping only
-// account-selectable models (visibility "list"). Best-effort: returns an empty Map on
-// any shape it does not recognize so callers fall back to the codex default.
-function parseModelCatalog(text) {
-  const trimmed = String(text ?? "").trim();
-  if (!trimmed) {
-    return new Map();
-  }
-  let parsed = null;
-  try {
-    parsed = JSON.parse(trimmed);
-  } catch {
-    // `codex debug models` prints a single JSON object; if anything ever wraps it,
-    // fall back to the outermost object rather than giving up on selection.
-    const start = trimmed.indexOf("{");
-    const end = trimmed.lastIndexOf("}");
-    if (start !== -1 && end > start) {
-      try {
-        parsed = JSON.parse(trimmed.slice(start, end + 1));
-      } catch {
-        parsed = null;
-      }
-    }
-  }
-  const models = parsed && Array.isArray(parsed.models) ? parsed.models : null;
-  const catalog = new Map();
-  if (!models) {
-    return catalog;
-  }
-  for (const model of models) {
-    if (!model || typeof model.slug !== "string" || model.visibility !== "list") {
-      continue;
-    }
-    const efforts = new Set();
-    if (Array.isArray(model.supported_reasoning_levels)) {
-      for (const level of model.supported_reasoning_levels) {
-        if (level && typeof level.effort === "string") {
-          efforts.add(level.effort);
-        }
-      }
-    }
-    catalog.set(model.slug, efforts);
-  }
-  return catalog;
-}
-
-// The catalog probe runs synchronously before every generate/edit dispatch, so it
-// must be bounded: a stalled `codex debug models` (bad network/proxy, hung catalog
-// refresh) would otherwise block the slash command before the image turn ever
-// starts. On timeout, spawnSync kills the probe and reports a non-zero/null status,
-// which the caller already treats as "catalog unavailable" -> codex config default.
-const CATALOG_PROBE_TIMEOUT_MS = 15_000;
-
-// Query the account's live model catalog. Best-effort and side-effect free: any
-// failure (codex missing, not logged in, offline, probe timeout) returns null and
-// the caller uses the codex config default rather than failing the generate/edit.
-function loadModelCatalog(cwd) {
-  const result = runSync(CODEX.command, [...CODEX.prefix, "debug", "models"], {
-    cwd,
-    maxBuffer: 32 * 1024 * 1024,
-    timeout: CATALOG_PROBE_TIMEOUT_MS
-  });
-  if (!result.available || result.status !== 0) {
-    return null;
-  }
-  return parseModelCatalog(result.stdout);
-}
-
-// Walk the ladder top-to-bottom; return the first rung whose model is in the catalog
-// and whose effort that model supports. null if the catalog is missing or no rung fits.
-function selectOrchestratorFromLadder(catalog, ladder = CODEX_IMAGE_ORCHESTRATOR_LADDER) {
-  if (!catalog) {
-    return null;
-  }
-  for (const rung of ladder) {
-    const efforts = catalog.get(rung.model);
-    if (efforts && efforts.has(rung.effort)) {
-      return { model: rung.model, effort: rung.effort };
-    }
-  }
-  return null;
-}
-
-// Resolve the orchestrator from an explicit env override or the ladder+catalog.
-// Pure: the catalog is passed in, so this is unit-testable without spawning codex.
-// - Both env vars set   -> use them (effort validated), source "env".
-// - Exactly one env set -> throw (an override must be explicit on both axes).
-// - Neither env set     -> first available ladder rung, source "ladder"; null if none.
-function resolveImageOrchestrator({ envModel, envEffort, catalog } = {}) {
-  const model = typeof envModel === "string" ? envModel.trim() : "";
-  const effort = typeof envEffort === "string" ? envEffort.trim().toLowerCase() : "";
-  if (Boolean(model) !== Boolean(effort)) {
-    throw new Error(
-      `${ORCHESTRATOR_MODEL_ENV} and ${ORCHESTRATOR_EFFORT_ENV} must be set together so the image orchestrator override is explicit.`
-    );
-  }
-  if (model && effort) {
-    if (!CODEX_REASONING_EFFORTS.has(effort)) {
-      throw new Error(
-        `Invalid ${ORCHESTRATOR_EFFORT_ENV}=${effort}; expected one of ${[...CODEX_REASONING_EFFORTS].join("|")}.`
-      );
-    }
-    return { model, effort, source: "env" };
-  }
-  const picked = selectOrchestratorFromLadder(catalog);
-  return picked ? { ...picked, source: "ladder" } : null;
-}
-
-// Impure wrapper: read env, probe the catalog only when no env override is present
-// (the override bypasses the probe), and resolve. Throws only on an inconsistent env
-// override; a catalog failure degrades to the codex default (null).
-function resolveOrchestrator(cwd) {
-  const envModel = process.env[ORCHESTRATOR_MODEL_ENV];
-  const envEffort = process.env[ORCHESTRATOR_EFFORT_ENV];
-  const hasEnv = Boolean(envModel?.trim()) || Boolean(envEffort?.trim());
-  const catalog = hasEnv ? null : loadModelCatalog(cwd);
-  return resolveImageOrchestrator({ envModel, envEffort, catalog });
-}
-
-// Signature of codex rejecting the requested orchestrator model/effort at turn
-// start — e.g. a custom `model_provider` that does not serve an official slug the
-// account catalog still lists, or an account losing access between probe and spawn.
-// Matched only on a non-zero exit, and only against codex's own `ERROR:` stderr
-// lines. Live shape on 0.144.5 and 0.154.0 (ChatGPT account):
-//   ERROR: {"type":"error","status":400,"error":{"type":"invalid_request_error",
-//   "message":"The 'X' model is not supported when using Codex with a ChatGPT account."}}
-// The broader alternates mirror chaptern's battle-tested classifier for the same
-// failure class (not available / unknown model / bad reasoning effort).
-const ORCHESTRATOR_REJECTION_PATTERN =
-  /(?:\bmodel\b[^\n]{0,240}\b(?:not supported|unsupported|not available|unavailable|does not exist|not found)\b)|(?:\bunknown model\b)|(?:\bmodel_not_found\b)|(?:\b(?:unsupported|invalid|unavailable)\b[^\n]{0,120}\breasoning effort\b)|(?:\breasoning effort\b[^\n]{0,160}\b(?:not supported|unsupported|unavailable|invalid)\b)|(?:\binvalid value\b[^\n]{0,120}\bmodel_reasoning_effort\b)/i;
-
-// codex may style stderr (e.g. under FORCE_COLOR) even when it is piped; classify
-// plain text only.
-function stripAnsi(text) {
-  return String(text ?? "").replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "");
-}
-
-// The error record is everything from codex's first `ERROR:` line to the end of
-// the captured text: a pretty-printed JSON rejection (custom providers) spans
-// several lines, and codex exits right after printing it.
-function isOrchestratorRejection(stderrText) {
-  const text = stripAnsi(stderrText);
-  const start = text.search(/^[ \t]*ERROR:/m);
-  return start !== -1 && ORCHESTRATOR_REJECTION_PATTERN.test(text.slice(start));
-}
-
-// `codex exec` prints an agent message as a bare `codex` line and a tool call as a
-// bare `exec` line on stderr. Either means the turn got past startup — the image
-// tool may already have run and been billed — so a later failure is never retried,
-// whatever its error text says. A model rejection happens before either appears.
-const TURN_EVENT_LINE = /^(codex|exec)\r?$/;
-
-// Bounded tail of codex's own stderr kept for the error record.
-const STDERR_TAIL_CHARS = 4000;
-
-// Streaming monitor for one codex exec attempt's stderr, fed raw chunks as they
-// arrive. `codex exec` echoes the full instruction under a `user` heading before any
-// event, and later prints agent messages and tool output to stderr too, so:
-// - the echo is skipped by matching the exact text the wrapper sent (prompt lines
-//   can then neither masquerade as events nor be mistaken for an error record);
-// - `started` is a sticky flag computed over the ENTIRE post-echo stream, so the
-//   bounded tail can never lose turn-start evidence, however much a tool printed;
-// - `tail` keeps the last STDERR_TAIL_CHARS of codex's own output for the record.
-// If the echo never matches (a codex version that no longer echoes verbatim), the
-// text is classified as codex's own once a size limit is hit or the process ends —
-// the conservative direction, since prompt lines can then only suppress a retry.
-function createStderrMonitor(instruction) {
-  const body = String(instruction ?? "");
-  let pending = body ? "" : null; // pre-echo accumulator; null once the echo is past
-  const pendingLimit = body.length + 65536;
-  let carry = "";
-  let started = false;
-  let tail = "";
-
-  function consumeOwn(text) {
-    tail = (tail + text).slice(-STDERR_TAIL_CHARS);
-    const lines = (carry + text).split("\n");
-    carry = lines.pop();
-    for (const line of lines) {
-      if (TURN_EVENT_LINE.test(stripAnsi(line))) {
-        started = true;
-      }
-    }
-  }
-
-  return {
-    feed(chunk) {
-      let text = String(chunk);
-      if (pending !== null) {
-        pending += text;
-        const at = pending.indexOf(body);
-        if (at !== -1) {
-          text = pending.slice(at + body.length);
-          pending = null;
-        } else if (pending.length > pendingLimit) {
-          text = pending;
-          pending = null;
-        } else {
-          return;
-        }
-      }
-      consumeOwn(text);
-    },
-    result() {
-      if (pending !== null) {
-        consumeOwn(pending);
-        pending = null;
-      }
-      if (carry) {
-        consumeOwn("");
-        if (TURN_EVENT_LINE.test(stripAnsi(carry))) {
-          started = true;
-        }
-      }
-      return { started, tail };
-    }
-  };
-}
-
-// Pure decision for the ladder fallback: require a startup rejection in codex's own
-// output and refuse once the turn has started.
-function shouldRetryWithoutOrchestrator(stderr) {
-  return Boolean(stderr) && !stderr.started && isOrchestratorRejection(stderr.tail);
-}
-
-// codex exec flags for a resolved orchestrator ([] when null => codex config default).
-// The `-c` value is TOML: JSON.stringify quotes the effort so codex parses a string.
-function orchestratorArgs(orchestrator) {
-  if (!orchestrator) {
-    return [];
-  }
-  return [
-    "-m",
-    orchestrator.model,
-    "-c",
-    `model_reasoning_effort=${JSON.stringify(orchestrator.effort)}`
-  ];
-}
-
-// Human-readable orchestrator line for `status`. Never throws: an inconsistent env
-// override is surfaced as a not-ok row so status can flag it instead of crashing.
-function describeOrchestrator(cwd) {
-  try {
-    const orchestrator = resolveOrchestrator(cwd);
-    if (!orchestrator) {
-      return {
-        ok: true,
-        detail:
-          "codex config default (no ladder model available for this account; generation still works)"
-      };
-    }
-    return {
-      ok: true,
-      detail: `${orchestrator.model} (effort ${orchestrator.effort}) [${orchestrator.source}]`
-    };
-  } catch (error) {
-    return { ok: false, detail: error.message };
-  }
 }
 
 function buildStatusReport(options = {}) {
   const cwd = resolveCwd(options);
+  const codex = getCodex();
+  const home = resolveCodexHome();
+  const childEnv = { ...process.env, CODEX_HOME: home.path };
   const nodeVersion = process.versions.node;
   const nodeVersionCompare = compareSemver(nodeVersion, MIN_NODE_VERSION);
   const nodeOk = nodeVersionCompare !== null && nodeVersionCompare >= 0;
 
-  const codexVersion = runSync(CODEX.command, [...CODEX.prefix, "--version"], { cwd });
+  const codexVersion = runSync(codex.command, [...codex.prefix, "--version"], { cwd });
   const codexVersionText = (codexVersion.stdout || codexVersion.stderr).trim();
   const codexVersionCompare = compareSemver(codexVersionText, MIN_CODEX_VERSION);
   const codexOk = codexVersion.available && codexVersion.status === 0 && codexVersionCompare !== null && codexVersionCompare >= 0;
 
-  const loginStatus = codexOk ? runSync(CODEX.command, [...CODEX.prefix, "login", "status"], { cwd }) : null;
+  // Login is checked against the resolved image home, since that is where the turn runs.
+  const loginStatus = codexOk ? runSync(codex.command, [...codex.prefix, "login", "status"], { cwd, env: childEnv }) : null;
   const loginText = loginStatus ? (loginStatus.stdout || loginStatus.stderr).trim() : "Codex unavailable";
   const loginOk = Boolean(loginStatus?.status === 0 && /logged in/i.test(loginText));
 
-  // Headless-mode probe: `--help` exits non-zero on an unknown flag or value without
-  // starting an agent turn, so this verifies the sandbox flag the wrapper dispatches with.
   const headlessExecStatus = codexOk
-    ? runSync(CODEX.command, [...CODEX.prefix, "exec", "--sandbox", "workspace-write", "--help"], { cwd })
+    ? runSync(codex.command, [...codex.prefix, "exec", "--sandbox", "workspace-write", "--help"], { cwd })
     : null;
   const headlessExecOk = Boolean(headlessExecStatus?.status === 0);
 
   // Probed independently of the headless flag: a rejected flag makes clap print a short
-  // usage error with no option list, which used to report `--image` as missing whenever
-  // the headless probe failed (#5).
-  const execHelp = codexOk ? runSync(CODEX.command, [...CODEX.prefix, "exec", "--help"], { cwd }) : null;
+  // usage error with no option list (#5).
+  const execHelp = codexOk ? runSync(codex.command, [...codex.prefix, "exec", "--help"], { cwd }) : null;
   const execHelpText = `${execHelp?.stdout ?? ""}\n${execHelp?.stderr ?? ""}`;
   const imageAttachmentOk = Boolean(execHelp?.status === 0 && /(^|\s)(-i,\s*)?--image(\s|=|<|$)/.test(execHelpText));
+  const jsonOk = Boolean(execHelp?.status === 0 && /--json\b/.test(execHelpText));
 
-  const imagegenSkillPath = findImagegenSkill();
+  const imagegenSkillPath = findImagegenSkill(home.path);
   const imagegenOk = Boolean(imagegenSkillPath);
 
-  const orchestrator = codexOk
-    ? describeOrchestrator(cwd)
-    : { ok: true, detail: "not checked (codex unavailable)" };
+  let defaults;
+  let defaultsError = null;
+  try {
+    const settings = resolveRunSettings({});
+    defaults = { mode: settings.mode, effort: settings.effort, model: settings.model ?? "account default" };
+  } catch (error) {
+    defaultsError = error.message;
+    defaults = { mode: "direct", effort: DEFAULT_EFFORT.direct, model: "account default" };
+  }
+  const sips = hasSips();
 
-  const ready =
-    nodeOk && codexOk && loginOk && headlessExecOk && imageAttachmentOk && imagegenOk && orchestrator.ok;
+  const loginKnown = codexOk;
+  // The imagegen skill is only used in skill mode; direct mode does not need it.
+  const ready = nodeOk && codexOk && loginOk && headlessExecOk && imageAttachmentOk && jsonOk && !defaultsError;
   const nextSteps = [];
   if (!nodeOk) {
     nextSteps.push(`Install Node.js ${MIN_NODE_VERSION} or newer.`);
@@ -508,8 +1342,8 @@ function buildStatusReport(options = {}) {
   } else if (!codexOk) {
     nextSteps.push(`Upgrade Codex CLI to ${MIN_CODEX_VERSION} or newer with \`npm install -g @openai/codex\`.`);
   }
-  if (codexOk && !loginOk) {
-    nextSteps.push("Run `codex login`.");
+  if (loginKnown && !loginOk) {
+    nextSteps.push(`Run \`CODEX_HOME=${home.path} codex login\` (or link auth.json, see README).`);
   }
   if (codexOk && !headlessExecOk) {
     nextSteps.push("This plugin depends on `codex exec --sandbox workspace-write`; check `codex exec --help` for the current sandbox flag.");
@@ -517,11 +1351,11 @@ function buildStatusReport(options = {}) {
   if (codexOk && !imageAttachmentOk) {
     nextSteps.push("This plugin depends on `codex exec --image` for edit and reference-image input. Upgrade Codex CLI.");
   }
-  if (!imagegenOk) {
-    nextSteps.push("The Codex imagegen skill was not found under CODEX_HOME. Reinstall or update Codex CLI.");
+  if (codexOk && !jsonOk) {
+    nextSteps.push("This plugin depends on `codex exec --json`. Upgrade Codex CLI.");
   }
-  if (codexOk && !orchestrator.ok) {
-    nextSteps.push(`Fix the image orchestrator override: ${orchestrator.detail}`);
+  if (defaultsError) {
+    nextSteps.push(`Fix the environment override: ${defaultsError}`);
   }
 
   const headlessExec = {
@@ -543,16 +1377,17 @@ function buildStatusReport(options = {}) {
     },
     login: { ok: loginOk, detail: loginText || "not logged in" },
     headlessExec,
-    // Deprecated alias for `status --json` consumers written against 0.2.0.
-    fullAuto: headlessExec,
+    jsonOutput: { ok: jsonOk, detail: jsonOk ? "`codex exec --json` accepted" : "not found in `codex exec --help`" },
     imageAttachment: {
       ok: imageAttachmentOk,
       detail: imageAttachmentOk
         ? "`codex exec --image` accepted"
         : "not found in `codex exec --help`"
     },
+    home: { path: home.path, source: home.source, dedicated: home.dedicated },
     imagegenSkill: { ok: imagegenOk, path: imagegenSkillPath },
-    orchestrator,
+    defaults,
+    sips: { ok: sips },
     nextSteps
   };
 }
@@ -563,16 +1398,22 @@ function renderStatusReport(report) {
   lines.push(statusLine(report.codex.ok, "Codex", `${report.codex.version} (minimum ${report.codex.minimum})`));
   lines.push(statusLine(report.login.ok, "Codex login", report.login.detail));
   lines.push(statusLine(report.headlessExec.ok, "Headless exec", report.headlessExec.detail));
+  lines.push(statusLine(report.jsonOutput.ok, "JSON events", report.jsonOutput.detail));
   lines.push(statusLine(report.imageAttachment.ok, "Image attachment", report.imageAttachment.detail));
-  lines.push(statusLine(report.imagegenSkill.ok, "imagegen skill", report.imagegenSkill.path ?? "not found"));
-  lines.push(statusLine(report.orchestrator.ok, "Image orchestrator", report.orchestrator.detail));
+  lines.push(
+    `INFO Image home: ${report.home.path} (${report.home.dedicated ? "dedicated ~/.codex-image" : `from ${report.home.source}, not the dedicated ~/.codex-image`})`
+  );
+  lines.push(`INFO imagegen skill (skill mode only): ${report.imagegenSkill.path ?? "not found under the image home"}`);
+  lines.push(`INFO Defaults: mode=${report.defaults.mode} effort=${report.defaults.effort} model=${report.defaults.model}`);
+  lines.push(`INFO sips (exact --size, format conversion, INFO lines): ${report.sips.ok ? "available" : "not available"}`);
   lines.push("");
   lines.push("Usage:");
-  lines.push('  /codex-image:generate "A watercolor moonlit library, save to images/library.png at 1024x1024"');
-  lines.push('  /codex-image:generate --ref style.png --ref subject.png "A poster using those references, save to images/poster.png"');
-  lines.push('  /codex-image:edit input.png "Replace the background with a clean white studio backdrop"');
+  lines.push('  /codex-image:generate --out images/library.png --size 1024x1024 "A watercolor moonlit library"');
+  lines.push('  /codex-image:generate --ref style.png --out images/poster.png "A poster using that style"');
+  lines.push('  /codex-image:edit --out edited.png input.png "Replace the background with a clean white studio backdrop"');
+  lines.push("  /codex-image:batch manifest.json --parallel 2");
   lines.push("");
-  lines.push("Cost note: image generation runs a Codex agent turn and uses the Codex built-in image generation tool.");
+  lines.push("Cost note: each image runs a Codex agent turn plus the built-in image generation tool (direct mode ~35 s, ~37k tokens).");
 
   if (report.nextSteps.length > 0) {
     lines.push("");
@@ -583,260 +1424,6 @@ function renderStatusReport(report) {
   }
 
   return lines.join("\n");
-}
-
-function splitFirstToken(raw) {
-  const text = String(raw ?? "").trim();
-  if (!text) {
-    return { input: null, prompt: null };
-  }
-  const quoted = text.match(/^(['"])((?:\\.|(?!\1).)+)\1(?:\s+([\s\S]+))?$/);
-  if (quoted) {
-    return { input: quoted[2], prompt: (quoted[3] ?? "").trim() };
-  }
-  const unquoted = text.match(/^(\S+)(?:\s+([\s\S]+))?$/);
-  if (unquoted) {
-    return { input: unquoted[1], prompt: (unquoted[2] ?? "").trim() };
-  }
-  return { input: null, prompt: null };
-}
-
-const REFERENCE_IMAGE_FLAGS = new Set(["--ref", "--reference", "--image"]);
-
-function parseGenerateArguments(raw) {
-  let rest = String(raw ?? "").trim();
-  const referenceImages = [];
-
-  while (rest) {
-    const first = splitFirstToken(rest);
-    const token = first.input;
-    if (!token) {
-      break;
-    }
-
-    if (token === "--") {
-      rest = first.prompt ?? "";
-      break;
-    }
-
-    if (REFERENCE_IMAGE_FLAGS.has(token)) {
-      const next = splitFirstToken(first.prompt ?? "");
-      if (!next.input || next.input.startsWith("--")) {
-        throw new Error(`Missing value for ${token}.`);
-      }
-      referenceImages.push(next.input);
-      rest = next.prompt ?? "";
-      continue;
-    }
-
-    const equalsMatch = token.match(/^(--ref|--reference|--image)=(.+)$/);
-    if (equalsMatch) {
-      referenceImages.push(equalsMatch[2]);
-      rest = first.prompt ?? "";
-      continue;
-    }
-
-    break;
-  }
-
-  if (referenceImages.length > MAX_REFERENCE_IMAGES) {
-    throw new Error(
-      `Too many reference images (${referenceImages.length}). The built-in image generation tool accepts at most ${MAX_REFERENCE_IMAGES} per request — pass the ${MAX_REFERENCE_IMAGES} most relevant.`
-    );
-  }
-
-  return {
-    referenceImages,
-    prompt: rest.trim()
-  };
-}
-
-function resolveExistingImagePaths(inputs, cwd, label) {
-  return inputs.map((input) => {
-    const resolved = path.resolve(cwd, input);
-    if (!fs.existsSync(resolved)) {
-      throw new Error(`${label} image not found: ${resolved}`);
-    }
-    return resolved;
-  });
-}
-
-function formatReferenceImages(referenceImagePaths) {
-  if (referenceImagePaths.length === 0) {
-    return "";
-  }
-  const lines = referenceImagePaths.map((imagePath, index) => `${index + 1}. ${imagePath}`);
-  return `\nReference images for generation (also attached to this turn via codex exec --image):\n${lines.join("\n")}\n\nThese are generation references, not edit targets. If your built-in image generation tool accepts local image paths (codex 0.144+, referenced_image_paths), pass the absolute paths above so the reference pixels condition the output directly; otherwise use the attachments as visual context for style, identity, composition, mood, or subject guidance according to the user's prompt. Do not modify or overwrite the referenced files.\n`;
-}
-
-const GENERATE_INSTRUCTION_PREFIX = `Use the imagegen skill. Built-in image_gen tool path only — do not use the CLI fallback (no OPENAI_API_KEY required).
-
-If the user did not specify an output path, save under ./codex-images/<UTC-timestamp>-<n>.png (n=1,2,... per image).
-
-For each saved image, print exactly one line:
-SAVED: <absolute path>
-`;
-
-function buildGenerateInstruction(prompt, referenceImagePaths) {
-  return `${GENERATE_INSTRUCTION_PREFIX}${formatReferenceImages(referenceImagePaths)}
-User request:
-
-${prompt}`;
-}
-
-function buildEditInstruction(inputPath, prompt) {
-  return `Use the imagegen skill. Built-in image_gen tool path only — do not use the CLI fallback (no OPENAI_API_KEY required).
-
-The edit target image (also attached to this turn via codex exec --image):
-${inputPath}
-
-If your built-in image generation tool accepts local image paths (codex 0.144+, referenced_image_paths), pass the absolute path above as the edit reference. Preserve unrelated parts unless the user request says otherwise.
-
-If the user did not specify an output path, save under ./codex-images/<UTC-timestamp>-edit-<n>.png (n=1,2,... per image).
-
-For each saved image, print exactly one line:
-SAVED: <absolute path>
-
-User edit request:
-
-${prompt}`;
-}
-
-function spawnCodex(args, cwd, options = {}) {
-  return new Promise((resolve, reject) => {
-    // teeStderr pipes stderr through this process (the user still sees codex's live
-    // output) while a streaming monitor classifies it so a failed attempt can be
-    // told apart from a startup rejection.
-    const monitor = options.teeStderr ? createStderrMonitor(options.instruction) : null;
-    const child = spawn(CODEX.command, [...CODEX.prefix, ...args], {
-      cwd,
-      env: process.env,
-      stdio: ["ignore", "inherit", monitor ? "pipe" : "inherit"],
-      windowsHide: true
-    });
-    if (monitor) {
-      child.stderr.setEncoding("utf8");
-      child.stderr.on("data", (chunk) => {
-        process.stderr.write(chunk);
-        monitor.feed(chunk);
-      });
-    }
-    child.on("error", reject);
-    child.on("close", (status, signal) => {
-      resolve({ status: status ?? (signal ? 1 : 0), stderr: monitor ? monitor.result() : null });
-    });
-  });
-}
-
-// Run one image turn. A ladder-selected orchestrator is best-effort at spawn time
-// too: the catalog can list a model the actual backend refuses (e.g. a custom
-// `model_provider` that does not serve official slugs). Such a rejection kills the
-// turn at startup — before the image tool runs, so no image tokens are spent — and
-// the wrapper retries once with no -m/-c, i.e. the codex config default that worked
-// before the ladder existed. An env-forced orchestrator (source "env") never falls
-// back: the user asserted that exact pair, so the error must surface instead.
-async function runImageTurn(orchestrator, tailArgs, cwd, instruction) {
-  const ladder = orchestrator?.source === "ladder";
-  const first = await spawnCodex(
-    [...CODEX_EXEC_BASE_ARGS, ...orchestratorArgs(orchestrator), ...tailArgs],
-    cwd,
-    { teeStderr: ladder, instruction }
-  );
-  if (ladder && first.status !== 0 && shouldRetryWithoutOrchestrator(first.stderr)) {
-    console.error(
-      `codex rejected the ladder orchestrator ${orchestrator.model} (effort ${orchestrator.effort}); retrying with the codex config default.`
-    );
-    return spawnCodex([...CODEX_EXEC_BASE_ARGS, ...tailArgs], cwd);
-  }
-  return first;
-}
-
-async function handleGenerate(argv) {
-  const raw = (argv.join(" ") || "").trim();
-  let parsed;
-  try {
-    parsed = parseGenerateArguments(raw);
-  } catch (error) {
-    console.error(`Error: ${error.message}`);
-    process.exitCode = 1;
-    return;
-  }
-  const { prompt, referenceImages } = parsed;
-  if (!prompt) {
-    console.error("Usage: /codex-image:generate [--ref <reference-image> ...] <natural-language image request>");
-    process.exitCode = 1;
-    return;
-  }
-  const cwd = process.cwd();
-  let referenceImagePaths;
-  try {
-    referenceImagePaths = resolveExistingImagePaths(referenceImages, cwd, "Reference");
-  } catch (error) {
-    console.error(`Error: ${error.message}`);
-    process.exitCode = 1;
-    return;
-  }
-  let orchestrator;
-  try {
-    orchestrator = resolveOrchestrator(cwd);
-  } catch (error) {
-    console.error(`Error: ${error.message}`);
-    process.exitCode = 1;
-    return;
-  }
-  if (orchestrator) {
-    console.error(
-      `codex image orchestrator: ${orchestrator.model} (effort ${orchestrator.effort}) [${orchestrator.source}]`
-    );
-  }
-  const tailArgs = [];
-  for (const imagePath of referenceImagePaths) {
-    tailArgs.push("--image", imagePath);
-  }
-  const instruction = buildGenerateInstruction(prompt, referenceImagePaths);
-  tailArgs.push("-C", cwd, "--", instruction);
-  const result = await runImageTurn(orchestrator, tailArgs, cwd, instruction);
-  if (result.status !== 0) {
-    process.exitCode = result.status;
-  }
-}
-
-async function handleEdit(argv) {
-  const raw = argv.join(" ").trim();
-  const { input, prompt } = splitFirstToken(raw);
-  if (!input || !prompt) {
-    console.error("Usage: /codex-image:edit <input-path> <edit instructions>");
-    process.exitCode = 1;
-    return;
-  }
-  const cwd = process.cwd();
-  let inputPath;
-  try {
-    inputPath = resolveExistingImagePaths([input], cwd, "Input")[0];
-  } catch (error) {
-    console.error(`Error: ${error.message}`);
-    process.exitCode = 1;
-    return;
-  }
-  let orchestrator;
-  try {
-    orchestrator = resolveOrchestrator(cwd);
-  } catch (error) {
-    console.error(`Error: ${error.message}`);
-    process.exitCode = 1;
-    return;
-  }
-  if (orchestrator) {
-    console.error(
-      `codex image orchestrator: ${orchestrator.model} (effort ${orchestrator.effort}) [${orchestrator.source}]`
-    );
-  }
-  const instruction = buildEditInstruction(inputPath, prompt);
-  const tailArgs = ["--image", inputPath, "-C", cwd, "--", instruction];
-  const result = await runImageTurn(orchestrator, tailArgs, cwd, instruction);
-  if (result.status !== 0) {
-    process.exitCode = result.status;
-  }
 }
 
 function handleStatus(argv) {
@@ -858,17 +1445,31 @@ function handleStatus(argv) {
 
 function usage() {
   return [
-    "Usage: node scripts/codex-image.mjs <command> [args]",
+    "Usage: codex-image <command> [args]   (or: node scripts/codex-image.mjs <command> [args])",
     "",
     "Commands:",
-    "  status [--json] [--cwd <dir>]                Report Codex CLI prerequisites and image support",
-    "  generate [--ref <path> ...] <request>         Dispatch a generate request to Codex's imagegen skill",
-    "  edit <input-path> <edit instructions>        Dispatch an edit request to Codex's imagegen skill (codex exec --image)",
+    "  status [--json] [--cwd <dir>]                 Report Codex CLI prerequisites and image support",
+    "  generate [flags] <request>                    Generate image(s)",
+    "  edit [flags] <input-path> <edit instructions> Edit an image",
+    "  batch <manifest.json> [--mode m] [--effort e] [--model s] [--parallel N]",
+    "",
+    "Flags (generate, edit; before the prompt, `--` ends flags):",
+    "  --out <path>        file (.png/.jpg/.jpeg/.webp) or directory; default ./codex-images/",
+    "  --size <W>x<H>      exact final size (cover + center-crop, needs sips on macOS)",
+    "  --transparent       request a transparent background",
+    "  --ref <path>        reference image (generate only, repeatable, max 5)",
+    "  --mode direct|skill default direct (env CODEX_IMAGE_MODE)",
+    "  --effort <e>        low|medium|high|xhigh|max|ultra (env CODEX_IMAGE_EFFORT)",
+    "  --model <slug>      default: account default (env CODEX_IMAGE_MODEL)",
+    "  --force             overwrite an existing --out file (default: -v2, -v3 ... sibling)",
+    "",
+    "Stdout: SAVED: <path>, INFO: <path> <W>x<H> alpha=<yes|no> source=<path>, USAGE: ...",
     "",
     "Each command is also exposed as a Claude Code plugin skill:",
     "  /codex-image:status",
     "  /codex-image:generate <...>",
-    "  /codex-image:edit <input-path> <...>"
+    "  /codex-image:edit <...>",
+    "  /codex-image:batch <manifest.json> [--parallel N]"
   ].join("\n");
 }
 
@@ -887,21 +1488,37 @@ async function main(argv = process.argv.slice(2)) {
   }
 
   if (command === "generate") {
-    await handleGenerate(rest);
+    await handleImageCommand("generate", rest);
     return;
   }
 
   if (command === "edit") {
-    await handleEdit(rest);
+    await handleImageCommand("edit", rest);
+    return;
+  }
+
+  if (command === "batch") {
+    await handleBatch(rest);
     return;
   }
 
   throw new Error(`Unknown command "${command}".\n${usage()}`);
 }
 
-// argv[1] is undefined when this module is imported from `node -e` / a REPL —
-// guard it so importing never crashes on the entry-point check itself.
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+// Resolve symlinks (~/.local/bin/codex-image -> scripts/codex-image.mjs) before comparing.
+// argv[1] is undefined when this module is imported from `node -e` / a REPL.
+function isMainModule() {
+  if (!process.argv[1]) {
+    return false;
+  }
+  try {
+    return fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+}
+
+if (isMainModule()) {
   main().catch((error) => {
     console.error(`Error: ${error.message}`);
     process.exit(1);
@@ -910,23 +1527,41 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
 
 export {
   CODEX_EXEC_BASE_ARGS,
+  DEFAULT_EFFORT,
+  MAX_REFERENCE_IMAGES,
+  applyCodexEvent,
+  buildCodexArgs,
+  buildDirectEditInstruction,
+  buildDirectGenerateInstruction,
   buildEditInstruction,
   buildGenerateInstruction,
+  buildSkillEditInstruction,
+  buildSkillGenerateInstruction,
   buildStatusReport,
-  resolveCodex,
   compareSemver,
-  parseSemver,
+  createEventState,
+  extractPromptAddDirs,
+  getCodex,
+  hasImageExtension,
+  main,
+  parseBatchArguments,
+  parseBatchManifest,
+  parseCodexJsonl,
+  parseEditArguments,
   parseGenerateArguments,
-  parseModelCatalog,
-  selectOrchestratorFromLadder,
-  resolveImageOrchestrator,
-  orchestratorArgs,
-  isOrchestratorRejection,
-  createStderrMonitor,
-  shouldRetryWithoutOrchestrator,
-  runImageTurn,
-  CODEX_IMAGE_ORCHESTRATOR_LADDER,
+  parseJsonLine,
+  parseSavedLines,
+  parseSemver,
+  parseSize,
+  planDestinations,
   renderStatusReport,
+  resolveCodex,
+  resolveCodexHome,
+  resolveOutTarget,
+  resolveRunSettings,
+  runImageJob,
   splitFirstToken,
-  timestampForFile
+  timestampForFile,
+  validateEffort,
+  versionedPath
 };
