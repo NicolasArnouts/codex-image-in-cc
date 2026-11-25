@@ -939,38 +939,70 @@ test("e2e the stdin trap: codex gets /dev/null as stdin (fake codex exits 3 if i
   }
 });
 
+async function waitFor(condition, ms, label) {
+  const deadline = Date.now() + ms;
+  while (!condition()) {
+    if (Date.now() > deadline) {
+      throw new Error(`timed out after ${ms} ms waiting for ${label}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
+function isAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Wait until every recorded pid is gone (a zombie still answers kill 0 until reaped).
+async function assertAllDead(pids) {
+  await waitFor(() => pids.every((pid) => !isAlive(pid)), 3000, `pids ${pids.join(",")} to die`).catch(() => {});
+  for (const pid of pids) {
+    assert.ok(!isAlive(pid), `process ${pid} must be dead`);
+  }
+}
+
+// Safety net: SIGKILL pids the fake codex recorded (processes this test spawned).
+function killRecorded(pids) {
+  for (const pid of pids) {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      // already gone
+    }
+  }
+}
+
+function readPids(pidFile) {
+  return fs.existsSync(pidFile) ? fs.readFileSync(pidFile, "utf8").split(" ").map(Number).filter(Boolean) : [];
+}
+
 test("e2e timeout escalates to SIGKILL when codex ignores SIGTERM and kills its process group", { skip: process.platform === "win32" }, async () => {
   const sb = makeSandbox();
+  const pidFile = path.join(sb.dir, "pids.txt");
   try {
-    const stubborn = path.join(sb.dir, "stubborn-codex.mjs");
-    const pidFile = path.join(sb.dir, "pids.txt");
-    fs.writeFileSync(
-      stubborn,
-      `#!/usr/bin/env node
-import { spawn } from "node:child_process";
-import fs from "node:fs";
-process.on("SIGTERM", () => {});
-const grandchild = spawn(process.execPath, ["-e", "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"], { stdio: "ignore" });
-fs.writeFileSync(${JSON.stringify(pidFile)}, process.pid + " " + grandchild.pid);
-setInterval(() => {}, 1000);
-`
-    );
-    fs.chmodSync(stubborn, 0o755);
     const started = Date.now();
+    // The timeout is generous so the stub has always started and written its pids
+    // before the wrapper gives up (a 400 ms timeout raced node startup: ENOENT).
     const result = await runCli(sb, ["generate", "p"], {
-      CODEX_IMAGE_CODEX_BIN: stubborn,
-      CODEX_IMAGE_TIMEOUT_MS: "400",
+      FAKE_CODEX_HANG: "1",
+      FAKE_CODEX_IGNORE_TERM: "1",
+      FAKE_CODEX_PID_FILE: pidFile,
+      CODEX_IMAGE_TIMEOUT_MS: "2500",
       CODEX_IMAGE_KILL_GRACE_MS: "300"
     });
     assert.equal(result.status, 1);
     assert.match(result.stderr, /timed out/);
-    assert.ok(Date.now() - started < 6000);
-    const [pid, grandPid] = fs.readFileSync(pidFile, "utf8").split(" ").map(Number);
-    await new Promise((resolve) => setTimeout(resolve, 300));
-    for (const target of [pid, grandPid]) {
-      assert.throws(() => process.kill(target, 0), /ESRCH/, `process ${target} must be dead`);
-    }
+    assert.ok(Date.now() - started < 15000);
+    const pids = readPids(pidFile);
+    assert.equal(pids.length, 2, "the stub recorded its pid and its grandchild's pid");
+    await assertAllDead(pids);
   } finally {
+    killRecorded(readPids(pidFile));
     sb.cleanup();
   }
 });
@@ -1030,6 +1062,211 @@ test("e2e --out ~/x.png and --ref ~/r.png resolve against HOME, no literal ./~ f
     assert.equal(result.status, 0, result.stderr);
     assert.deepEqual(savedPaths(result.stdout), [path.join(fakeHome, "x.png")]);
     assert.ok(!fs.existsSync(path.join(work, "~")), "no literal ~ folder");
+  } finally {
+    sb.cleanup();
+  }
+});
+
+function spawnCli(sandbox, args, extraEnv = {}) {
+  const child = spawn(process.execPath, [SCRIPT, ...args], {
+    cwd: sandbox.dir,
+    env: {
+      ...process.env,
+      CODEX_IMAGE_CODEX_BIN: FAKE_CODEX,
+      CODEX_IMAGE_HOME: sandbox.home,
+      CODEX_IMAGE_MODE: "",
+      CODEX_IMAGE_EFFORT: "",
+      CODEX_IMAGE_MODEL: "",
+      ...extraEnv
+    },
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", (chunk) => (stdout += chunk));
+  child.stderr.on("data", (chunk) => (stderr += chunk));
+  const done = new Promise((resolve) => child.on("close", (status, signal) => resolve({ status, signal, stdout, stderr })));
+  return { child, done };
+}
+
+for (const [signal, code, mode, ignoreTerm] of [
+  ["SIGINT", 130, "direct", false],
+  ["SIGTERM", 143, "direct", false],
+  ["SIGHUP", 129, "direct", false],
+  ["SIGINT", 130, "skill", true]
+]) {
+  test(`e2e ${signal} to the wrapper (${mode} mode${ignoreTerm ? ", codex ignores SIGTERM" : ""}) kills codex's process group, leaves no files, exits ${code}`, { skip: process.platform === "win32" }, async () => {
+    const sb = makeSandbox();
+    const pidFile = path.join(sb.dir, "pids.txt");
+    const tmp = path.join(sb.dir, "tmp");
+    fs.mkdirSync(tmp);
+    try {
+      const outDir = path.join(sb.dir, "out", "nested");
+      const { child, done } = spawnCli(sb, ["generate", "--mode", mode, "--out", path.join(outDir, "hero.png"), "p"], {
+        FAKE_CODEX_HANG: "1",
+        FAKE_CODEX_IGNORE_TERM: ignoreTerm ? "1" : "",
+        FAKE_CODEX_PID_FILE: pidFile,
+        CODEX_IMAGE_KILL_GRACE_MS: "500",
+        TMPDIR: tmp
+      });
+      await waitFor(() => fs.existsSync(pidFile), 10000, "the fake codex pid file");
+      if (mode === "direct") {
+        assert.ok(!fs.existsSync(path.join(outDir, "hero.png")), "direct mode reserves no placeholder during the turn");
+      } else {
+        assert.equal(fs.statSync(path.join(outDir, "hero.png")).size, 0, "skill mode reserved its placeholder up front");
+      }
+      child.kill(signal);
+      const result = await done;
+      assert.equal(result.status, code, `exit code (signal=${result.signal}) stderr: ${result.stderr}`);
+      assert.match(result.stderr, new RegExp(`${signal} received`));
+      await assertAllDead(readPids(pidFile));
+      assert.ok(!fs.existsSync(path.join(sb.dir, "out")), "placeholder, temp files and created dirs removed");
+      assert.deepEqual(fs.readdirSync(tmp), [], "temp dir removed");
+    } finally {
+      killRecorded(readPids(pidFile));
+      sb.cleanup();
+    }
+  });
+}
+
+test("e2e SIGINT in a pre-existing out dir removes only the placeholder and keeps the dir and other files", { skip: process.platform === "win32" }, async () => {
+  const sb = makeSandbox();
+  const pidFile = path.join(sb.dir, "pids.txt");
+  try {
+    const keep = path.join(sb.dir, "keep.png");
+    fs.writeFileSync(keep, "mine");
+    const { child, done } = spawnCli(sb, ["generate", "--mode", "skill", "--out", path.join(sb.dir, "keep.png"), "p"], {
+      FAKE_CODEX_HANG: "1",
+      FAKE_CODEX_PID_FILE: pidFile
+    });
+    await waitFor(() => fs.existsSync(pidFile), 10000, "the fake codex pid file");
+    assert.ok(fs.existsSync(path.join(sb.dir, "keep-v2.png")));
+    child.kill("SIGINT");
+    const result = await done;
+    assert.equal(result.status, 130);
+    assert.ok(!fs.existsSync(path.join(sb.dir, "keep-v2.png")));
+    assert.equal(fs.readFileSync(keep, "utf8"), "mine");
+  } finally {
+    killRecorded(readPids(pidFile));
+    sb.cleanup();
+  }
+});
+
+test("e2e a failure while finalizing (EACCES on the generated files) leaves no placeholder behind", { skip: process.platform === "win32" || process.getuid?.() === 0 }, async () => {
+  const sb = makeSandbox();
+  try {
+    const outDir = path.join(sb.dir, "keep");
+    fs.mkdirSync(outDir);
+    const result = await runCli(sb, ["generate", "--out", path.join(outDir, "x.png"), "p"], { FAKE_CODEX_IMAGES: "2", FAKE_CODEX_UNREADABLE: "1" });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /could not save the generated image: .*EACCES/);
+    assert.deepEqual(fs.readdirSync(outDir), [], "no 0-byte x-1.png / x-2.png and no temp file");
+    const fresh = path.join(sb.dir, "fresh");
+    const again = await runCli(sb, ["generate", "--mode", "skill", "--out", fresh, "p"], { FAKE_CODEX_UNREADABLE: "1" });
+    assert.equal(again.status, 1);
+    assert.ok(!fs.existsSync(fresh), "skill placeholder and the created dir removed");
+  } finally {
+    sb.cleanup();
+  }
+});
+
+test("e2e a long --out basename does not overflow NAME_MAX through the temp-file prefix", async () => {
+  const sb = makeSandbox();
+  try {
+    const out = path.join(sb.dir, `${"a".repeat(240)}.png`);
+    const result = await runCli(sb, ["generate", "--out", out, "p"]);
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(savedPaths(result.stdout), [out]);
+    assert.ok(fs.statSync(out).size > 0);
+  } finally {
+    sb.cleanup();
+  }
+});
+
+test("e2e source format is detected by magic bytes: jpeg data (even named .png) becomes a real png", { skip: !isMac }, async () => {
+  const sb = makeSandbox();
+  try {
+    for (const ext of [".jpg", ".png"]) {
+      const out = path.join(sb.dir, `from-jpeg${ext.replace(".", "-")}.png`);
+      const result = await runCli(sb, ["generate", "--out", out, "p"], { FAKE_CODEX_FORMAT: "jpeg", FAKE_CODEX_EXT: ext });
+      assert.equal(result.status, 0, result.stderr);
+      assert.deepEqual([...fs.readFileSync(out).subarray(0, 4)], [0x89, 0x50, 0x4e, 0x47], `PNG magic for a jpeg source named ${ext}`);
+    }
+  } finally {
+    sb.cleanup();
+  }
+});
+
+test("e2e a format mismatch without sips fails that image clearly and leaves no placeholder", async () => {
+  const sb = makeSandbox();
+  try {
+    const cases = [
+      { env: { FAKE_CODEX_FORMAT: "webp" }, out: "w.png", source: "webp" },
+      { env: {}, out: "p.jpg", source: "png" }
+    ];
+    for (const item of cases) {
+      const out = path.join(sb.dir, item.out);
+      const result = await runCli(sb, ["generate", "--out", out, "p"], { ...item.env, CODEX_IMAGE_DISABLE_SIPS: "1" });
+      assert.equal(result.status, 1, item.out);
+      assert.match(result.stderr, new RegExp(`is ${item.source} but .* needs .*sips`));
+      assert.ok(!fs.existsSync(out));
+    }
+    assert.deepEqual(fs.readdirSync(sb.dir).sort(), ["home"], "no kept-png fallback, no temp file");
+  } finally {
+    sb.cleanup();
+  }
+});
+
+test("e2e --force with a directory target never overwrites: timestamp names stay versioned", async () => {
+  const sb = makeSandbox();
+  try {
+    const dir = path.join(sb.dir, "d");
+    fs.mkdirSync(dir);
+    // Occupy the timestamp names this run can pick (now .. now+3 s).
+    const now = Date.now();
+    const occupied = [0, 1, 2, 3].map((s) => path.join(dir, `${timestampForFile(new Date(now + s * 1000))}-1.png`));
+    for (const file of occupied) {
+      fs.writeFileSync(file, "keep");
+    }
+    const result = await runCli(sb, ["generate", "--force", "--out", dir, "p"]);
+    assert.equal(result.status, 0, result.stderr);
+    for (const file of occupied) {
+      assert.equal(fs.readFileSync(file, "utf8"), "keep", `${file} was overwritten`);
+    }
+    const [saved] = savedPaths(result.stdout);
+    assert.match(path.basename(saved), /^\d{8}-\d{6}Z-1-v2\.png$/);
+  } finally {
+    sb.cleanup();
+  }
+});
+
+test("missing thread id: an orphan thread dir created just before the spawn is never claimed", async () => {
+  const sb = makeSandbox();
+  try {
+    const orphan = path.join(sb.home, "generated_images", "orphan-thread");
+    fs.mkdirSync(orphan, { recursive: true });
+    fs.copyFileSync(FAKE_CODEX, path.join(orphan, "fake.png"));
+    const out = path.join(sb.dir, "o.png");
+    const result = await runCli(sb, ["generate", "--out", out, "p"], { FAKE_CODEX_NO_THREAD: "1", FAKE_CODEX_IMAGES: "0" });
+    assert.equal(result.status, 1, result.stdout);
+    assert.ok(!fs.existsSync(out), "the orphan's image was not taken");
+    assert.ok(fs.existsSync(path.join(orphan, "fake.png")));
+  } finally {
+    sb.cleanup();
+  }
+});
+
+test("missing thread id and no session rollout created after the spawn: fail and leave the image where it is", async () => {
+  const sb = makeSandbox();
+  try {
+    const out = path.join(sb.dir, "n.png");
+    const result = await runCli(sb, ["generate", "--out", out, "p"], { FAKE_CODEX_NO_THREAD: "1", FAKE_CODEX_NO_ROLLOUT: "1" });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /no thread id from codex.*left in .*generated_images/);
+    assert.ok(!fs.existsSync(out));
+    const dirs = fs.readdirSync(path.join(sb.home, "generated_images"));
+    assert.equal(dirs.length, 1);
+    assert.equal(fs.readdirSync(path.join(sb.home, "generated_images", dirs[0])).length, 1, "image left in place");
   } finally {
     sb.cleanup();
   }

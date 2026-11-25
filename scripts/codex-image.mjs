@@ -791,6 +791,10 @@ function createJsonlStreamer(state, emit) {
 // Resolves { status, timedOut, state, stderrTail }.
 function runCodexTurn({ args, cwd, home, label = "", onProgress }) {
   return new Promise((resolve, reject) => {
+    if (interruptedBy) {
+      reject(new Error(`interrupted by ${interruptedBy}`));
+      return;
+    }
     const codex = getCodex();
     const state = createEventState();
     const prefix = label ? `codex-image: [${label}] ` : "codex-image: ";
@@ -828,6 +832,9 @@ function runCodexTurn({ args, cwd, home, label = "", onProgress }) {
     // If this wrapper itself exits, do not leave an orphaned codex group behind.
     const onParentExit = () => signalChild("SIGTERM");
     process.once("exit", onParentExit);
+    // Registered so a signal to the wrapper can stop this child's whole process group.
+    const handle = { signal: signalChild, exited: false };
+    activeChildren.add(handle);
 
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk) => streamer.feed(chunk));
@@ -853,6 +860,7 @@ function runCodexTurn({ args, cwd, home, label = "", onProgress }) {
       clearTimeout(killTimer);
       clearTimeout(exitTimer);
       process.removeListener("exit", onParentExit);
+      activeChildren.delete(handle);
       streamer.end();
       child.stdout.destroy();
       child.stderr.destroy();
@@ -868,14 +876,72 @@ function runCodexTurn({ args, cwd, home, label = "", onProgress }) {
       clearTimeout(killTimer);
       clearTimeout(exitTimer);
       process.removeListener("exit", onParentExit);
+      activeChildren.delete(handle);
       reject(error);
     });
     // 'close' waits for the pipes; a grandchild holding them open must not hang us.
     child.on("exit", (status, signal) => {
+      handle.exited = true;
       exitTimer = setTimeout(() => finish(status, signal), 2000);
     });
     child.on("close", (status, signal) => finish(status, signal));
   });
+}
+
+// ---------------------------------------------------------------------------
+// Signals: Ctrl-C / SIGTERM / SIGHUP must not leave codex running or files behind
+// ---------------------------------------------------------------------------
+
+// Codex runs detached in its own process group, so a terminal Ctrl-C (sent to the
+// wrapper's foreground group) or a SIGTERM to the wrapper never reaches it. Every live
+// child group and every job's cleanup state is registered here.
+const activeChildren = new Set();
+const activeJobContexts = new Set();
+let interruptedBy = null;
+const SIGNAL_EXIT_CODES = { SIGINT: 130, SIGTERM: 143, SIGHUP: 129 };
+const SIGNAL_GRACE_MS = 3000;
+
+function cleanupAllJobs() {
+  for (const ctx of activeJobContexts) {
+    cleanupJob(ctx);
+  }
+}
+
+// SIGTERM every codex group, wait (bounded) for the leaders to exit, then SIGKILL every
+// group anyway (a grandchild may ignore SIGTERM), remove unfilled placeholders, temp
+// files and dirs this run created, and exit 128+signo. A second signal skips the wait.
+async function handleTerminationSignal(signal) {
+  const code = SIGNAL_EXIT_CODES[signal] ?? 1;
+  const handles = [...activeChildren];
+  if (interruptedBy) {
+    for (const handle of handles) {
+      handle.signal("SIGKILL");
+    }
+    cleanupAllJobs();
+    process.exit(code);
+  }
+  interruptedBy = signal;
+  process.stderr.write(`codex-image: ${signal} received; stopping codex and removing unfinished files\n`);
+  for (const handle of handles) {
+    handle.signal("SIGTERM");
+  }
+  const deadline = Date.now() + Math.min(killGraceMs(), SIGNAL_GRACE_MS);
+  while (Date.now() < deadline && handles.some((handle) => !handle.exited)) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  for (const handle of handles) {
+    handle.signal("SIGKILL");
+  }
+  cleanupAllJobs();
+  process.exit(code);
+}
+
+function installSignalHandlers() {
+  for (const signal of Object.keys(SIGNAL_EXIT_CODES)) {
+    process.on(signal, () => {
+      handleTerminationSignal(signal);
+    });
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -885,7 +951,8 @@ function runCodexTurn({ args, cwd, home, label = "", onProgress }) {
 let sipsAvailable = null;
 function hasSips() {
   if (sipsAvailable === null) {
-    if (process.platform !== "darwin") {
+    // Test hook: CODEX_IMAGE_DISABLE_SIPS=1 behaves like a machine without sips.
+    if (process.platform !== "darwin" || process.env.CODEX_IMAGE_DISABLE_SIPS === "1") {
       sipsAvailable = false;
     } else {
       const result = spawnSync("sips", ["--help"], { stdio: "pipe", encoding: "utf8" });
@@ -932,9 +999,40 @@ function applySize(file, size) {
   return crop.status === 0;
 }
 
-function convertImage(source, destination) {
-  const result = spawnSync("sips", ["-s", "format", "jpeg", source, "--out", destination], { stdio: "pipe" });
-  return result.status === 0 && fs.existsSync(destination);
+function convertImage(source, destination, format) {
+  const result = spawnSync("sips", ["-s", "format", format, source, "--out", destination], { stdio: "pipe" });
+  try {
+    return result.status === 0 && detectImageFormat(destination) === format;
+  } catch {
+    return false;
+  }
+}
+
+// Real format by magic bytes (the extension codex or a skill picked may lie). null for
+// an unrecognized format; read errors (EACCES ...) are thrown.
+function detectImageFormat(file) {
+  const header = Buffer.alloc(12);
+  const fd = fs.openSync(file, "r");
+  try {
+    fs.readSync(fd, header, 0, 12, 0);
+  } finally {
+    fs.closeSync(fd);
+  }
+  if (header.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) {
+    return "png";
+  }
+  if (header[0] === 0xff && header[1] === 0xd8 && header[2] === 0xff) {
+    return "jpeg";
+  }
+  if (header.subarray(0, 4).toString("latin1") === "RIFF" && header.subarray(8, 12).toString("latin1") === "WEBP") {
+    return "webp";
+  }
+  return null;
+}
+
+function formatForExtension(file) {
+  const ext = path.extname(file).toLowerCase();
+  return ext === ".png" ? "png" : ext === ".jpg" || ext === ".jpeg" ? "jpeg" : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -967,7 +1065,14 @@ function sortedPaths(files) {
   return files.sort((a, b) => a.mtimeMs - b.mtimeMs || a.path.localeCompare(b.path)).map((file) => file.path);
 }
 
-// Thread dirs under generated_images created after `sinceMs` that nobody claimed.
+// A path's creation time, or null when the filesystem does not record one (then the
+// creation order cannot be proven and nothing is attributed).
+function birthtimeOf(stat) {
+  return stat.birthtimeMs > 0 ? stat.birthtimeMs : null;
+}
+
+// Unclaimed thread dirs under generated_images that changed at or after `sinceMs`
+// (no look-back), each with its creation time (null if unknown).
 function findNewThreadDirs(home, sinceMs) {
   const root = path.join(home, "generated_images");
   let dirs = [];
@@ -978,25 +1083,62 @@ function findNewThreadDirs(home, sinceMs) {
   }
   return dirs
     .map((entry) => ({ name: entry.name, stat: fs.statSync(path.join(root, entry.name)) }))
-    .filter(({ name, stat }) => !claimedThreads.has(name) && (stat.birthtimeMs > 0 ? stat.birthtimeMs : stat.ctimeMs) >= sinceMs)
-    .map(({ name }) => name);
+    .filter(({ name, stat }) => !claimedThreads.has(name) && Math.max(stat.mtimeMs, birthtimeOf(stat) ?? 0) >= sinceMs)
+    .map(({ name, stat }) => ({ name, born: birthtimeOf(stat) }));
+}
+
+// Does $CODEX_HOME/sessions/**/rollout-*-<threadId>.jsonl exist, created at or after
+// `sinceMs`? That ties a thread dir to a session started by this spawn, not by an
+// orphaned earlier run that is still writing images.
+function hasRolloutSince(home, threadId, sinceMs) {
+  const suffix = `-${threadId}.jsonl`;
+  const walk = (dir, depth) => {
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return false;
+    }
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory() && depth < 4) {
+        if (walk(full, depth + 1)) {
+          return true;
+        }
+      } else if (entry.isFile() && entry.name.startsWith("rollout-") && entry.name.endsWith(suffix)) {
+        try {
+          const born = birthtimeOf(fs.statSync(full));
+          if (born !== null && born >= sinceMs) {
+            return true;
+          }
+        } catch {
+          // vanished
+        }
+      }
+    }
+    return false;
+  };
+  return walk(path.join(home, "sessions"), 0);
 }
 
 // Files codex generated for this turn, oldest first. Known thread id: that thread's dir.
-// Missing thread id: only a single, unclaimed thread dir created after the spawn, and
-// never while another job is running (ambiguous) -> { error }.
+// Missing thread id: only a single unclaimed thread dir CREATED at or after the spawn
+// whose session rollout was also created after the spawn, and never while another job
+// is running. Anything else that appeared is left where it is -> { error }.
 function collectGeneratedImages(home, threadId, sinceMs) {
   const root = path.join(home, "generated_images");
   let id = threadId;
   if (!id) {
-    const candidates = findNewThreadDirs(home, sinceMs);
-    if (candidates.length > 0 && (candidates.length > 1 || activeJobs > 1)) {
+    const fresh = findNewThreadDirs(home, sinceMs);
+    const attributable = fresh.filter(({ name, born }) => born !== null && born >= sinceMs && hasRolloutSince(home, name, sinceMs));
+    if (attributable.length === 1 && fresh.length === 1 && activeJobs <= 1) {
+      id = attributable[0].name;
+    } else if (fresh.length > 0) {
       return {
         files: [],
-        error: "codex reported no thread id and the generated images cannot be attributed to this item unambiguously; not saving them"
+        error: `no thread id from codex, so the generated image(s) cannot be attributed to this item unambiguously; image(s) left in ${root}`
       };
     }
-    id = candidates[0] ?? null;
   }
   if (!id) {
     return { files: [], error: null };
@@ -1093,23 +1235,72 @@ function removeCreatedDirs(root, leaf) {
   }
 }
 
-// Write `source` to `destination` atomically: stage in a temp file inside the destination
-// dir (convert / resize there), then rename onto the placeholder we reserved. Never writes
-// into a file we did not reserve (except with an explicit --force).
-function materialize({ source, destination, size, force, warnings }) {
-  const dir = path.dirname(destination);
-  const temp = path.join(dir, `.codex-image-${process.pid}-${crypto.randomBytes(4).toString("hex")}-${path.basename(destination)}`);
-  let finalPath = destination;
-  const ext = path.extname(destination).toLowerCase();
-  const sourceIsPng = path.extname(source).toLowerCase() === ".png";
+// Per-job cleanup state: every placeholder this job reserved, which of them got a final
+// image, temp files and temp dirs, and the first directory this job created. Cleaned in
+// the job's finally and by the signal handler, so no exit path leaves a 0-byte file.
+function createJobContext() {
+  return { placeholders: new Set(), filled: new Set(), temps: new Set(), tmpDirs: new Set(), createdRoot: null, outDir: null };
+}
+
+function cleanupJob(ctx) {
+  for (const temp of ctx.temps) {
+    fs.rmSync(temp, { force: true });
+  }
+  ctx.temps.clear();
+  for (const dir of ctx.tmpDirs) {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+  ctx.tmpDirs.clear();
+  for (const file of ctx.placeholders) {
+    if (ctx.filled.has(file)) {
+      continue;
+    }
+    if (interruptedBy) {
+      // Interrupted: whatever is in a placeholder we reserved is unfinished.
+      fs.rmSync(file, { force: true });
+    } else {
+      removeIfEmpty(file);
+    }
+  }
+  ctx.placeholders.clear();
+  removeCreatedDirs(ctx.createdRoot, ctx.outDir);
+}
+
+// Reserve `file` (O_EXCL, next -vN) and record it as this job's placeholder. With
+// force (explicit file targets only) the exact path is used without a placeholder.
+function reserveFor(ctx, file, force) {
+  const reserved = reserveFile(file, { force });
+  if (!force) {
+    ctx.placeholders.add(reserved);
+  }
+  return reserved;
+}
+
+// Short temp name next to `destination` (a long destination basename must not push the
+// temp name past NAME_MAX); keeps the extension so sips sees the right type.
+function tempPathFor(destination) {
+  return path.join(path.dirname(destination), `.codex-image-${crypto.randomBytes(6).toString("hex")}${path.extname(destination)}`);
+}
+
+// Write `source` to `destination` atomically: stage in a temp file inside the
+// destination dir, convert when the real format (magic bytes) differs from the
+// destination extension, resize, then rename onto the reserved placeholder. Throws when
+// the image cannot be written in the requested format.
+function materialize({ source, destination, size, warnings, ctx }) {
+  const temp = tempPathFor(destination);
+  ctx.temps.add(temp);
   try {
-    if (ext !== ".png" && sourceIsPng) {
-      if (!(hasSips() && convertImage(source, temp))) {
-        const pngPath = `${destination.slice(0, destination.length - ext.length)}.png`;
-        warnings.push(`could not convert to ${ext}; kept png at ${pngPath}`);
-        removeIfEmpty(destination);
-        finalPath = reserveFile(pngPath, { force });
-        fs.copyFileSync(source, temp);
+    const sourceFormat = detectImageFormat(source);
+    const targetFormat = formatForExtension(destination);
+    if (!sourceFormat) {
+      throw new Error(`${source} is not a png, jpeg or webp image`);
+    }
+    if (sourceFormat !== targetFormat) {
+      if (!hasSips()) {
+        throw new Error(`${source} is ${sourceFormat} but ${destination} needs ${targetFormat}; converting needs macOS sips, which is not available (use --out with a .${sourceFormat === "jpeg" ? "jpg" : sourceFormat} name)`);
+      }
+      if (!convertImage(source, temp, targetFormat)) {
+        throw new Error(`sips could not convert ${source} from ${sourceFormat} to ${targetFormat}`);
       }
     } else {
       fs.copyFileSync(source, temp);
@@ -1117,17 +1308,49 @@ function materialize({ source, destination, size, force, warnings }) {
     if (size) {
       if (hasSips()) {
         if (!applySize(temp, size)) {
-          warnings.push(`size not applied to ${finalPath} (sips failed)`);
+          warnings.push(`size not applied to ${destination} (sips failed)`);
         }
       } else {
         warnings.push("size not applied (sips not available)");
       }
     }
-    fs.renameSync(temp, finalPath);
+    fs.renameSync(temp, destination);
   } finally {
     fs.rmSync(temp, { force: true });
+    ctx.temps.delete(temp);
   }
-  return finalPath;
+  return destination;
+}
+
+// A skill-mode file codex saved itself whose bytes do not match its extension is
+// converted in place when sips is available.
+function fixInPlaceFormat(file, warnings, ctx) {
+  let actual;
+  try {
+    actual = detectImageFormat(file);
+  } catch {
+    return;
+  }
+  const wanted = formatForExtension(file);
+  if (!actual || !wanted || actual === wanted) {
+    return;
+  }
+  if (!hasSips()) {
+    warnings.push(`${file} contains ${actual} data but has a .${path.extname(file).slice(1)} name (sips not available to convert)`);
+    return;
+  }
+  const temp = tempPathFor(file);
+  ctx.temps.add(temp);
+  try {
+    if (convertImage(file, temp, wanted)) {
+      fs.renameSync(temp, file);
+    } else {
+      warnings.push(`could not convert ${file} from ${actual} to ${wanted}`);
+    }
+  } finally {
+    fs.rmSync(temp, { force: true });
+    ctx.temps.delete(temp);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1139,41 +1362,46 @@ function materialize({ source, destination, size, force, warnings }) {
 // Returns { ok, reason, stderrTail, lines: [stdout lines], saved, usageLine, warnings }.
 async function runImageJob(job, options = {}) {
   activeJobs += 1;
+  const ctx = createJobContext();
+  activeJobContexts.add(ctx);
   try {
-    return await runImageJobInner(job, options);
+    return await runImageJobInner(job, options, ctx);
   } catch (error) {
     return { ok: false, reason: error.message, stderrTail: "", lines: [], saved: [], warnings: [] };
   } finally {
+    // Whatever happened (success, codex failure, EACCES/ENOSPC while finalizing), no
+    // placeholder that never got an image, temp file or created empty dir survives.
+    cleanupJob(ctx);
+    activeJobContexts.delete(ctx);
     activeJobs -= 1;
   }
 }
 
-async function runImageJobInner(job, { onProgress } = {}) {
+async function runImageJobInner(job, { onProgress } = {}, ctx = createJobContext()) {
   const cwd = job.cwd ?? process.cwd();
   const settings = resolveRunSettings(job);
   const home = resolveCodexHome().path;
   const edit = job.kind === "edit";
-  const force = Boolean(job.force);
   const outTarget = resolveOutTarget(job.out, cwd);
+  // --force only means "overwrite this exact file". A directory target always gets
+  // fresh, versioned timestamp names (a same-second rerun must not overwrite).
+  const force = Boolean(job.force) && outTarget.kind === "file";
+  const skill = settings.mode === "skill";
   const warnings = [];
   if (job.transparent && outTarget.kind === "file" && [".jpg", ".jpeg"].includes(path.extname(outTarget.path).toLowerCase())) {
     warnings.push("--transparent with a .jpg/.jpeg out: JPEG has no alpha channel, transparency is dropped");
   }
 
-  // Reserve a concrete, unique primary file name before anything is spawned.
-  const createdRoot = fs.mkdirSync(outTarget.dir, { recursive: true });
+  ctx.createdRoot = fs.mkdirSync(outTarget.dir, { recursive: true }) ?? null;
+  ctx.outDir = outTarget.dir;
   const prefix = dirNamePrefix(timestampForFile(), edit);
   const primary = outTarget.kind === "file" ? outTarget.path : path.join(outTarget.path, `${prefix}1.png`);
-  const reserved = reserveFile(primary, { force });
-  const placeholders = force ? [] : [reserved];
-  const discard = () => {
-    for (const file of placeholders) {
-      removeIfEmpty(file);
-    }
-    removeCreatedDirs(createdRoot, outTarget.dir);
-  };
+  // Skill mode: Codex writes the file itself, so it needs a concrete, already reserved
+  // name up front. Direct mode reserves names only when the images are copied, so no
+  // 0-byte file sits in the user's folder during the 30-90 s turn.
+  const reserved = skill ? reserveFor(ctx, primary, force) : null;
 
-  const skillTarget = { ...outTarget, reserved, prefix, force };
+  const skillTarget = { ...outTarget, reserved: reserved ?? primary, prefix, force };
   const common = { prompt: job.prompt, transparent: Boolean(job.transparent), size: job.size ?? null };
   const instruction = edit
     ? buildEditInstruction({ mode: settings.mode, inputPath: job.inputPath, outTarget: skillTarget, ...common })
@@ -1185,11 +1413,12 @@ async function runImageJobInner(job, { onProgress } = {}) {
       });
 
   const addDirs = [outTarget.dir];
-  if (settings.mode === "skill") {
+  if (skill) {
     addDirs.push(...extractPromptAddDirs(job.prompt));
   }
   const images = edit ? [job.inputPath] : job.referenceImagePaths ?? [];
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-image-"));
+  ctx.tmpDirs.add(tmpDir);
   const lastMessageFile = path.join(tmpDir, "last-message.txt");
   const args = buildCodexArgs({
     cwd,
@@ -1207,9 +1436,10 @@ async function runImageJobInner(job, { onProgress } = {}) {
   try {
     turn = await runCodexTurn({ args, cwd, home, label: job.label, onProgress });
   } catch (error) {
-    fs.rmSync(tmpDir, { recursive: true, force: true });
-    discard();
     return { ok: false, reason: `could not run codex: ${error.message}`, stderrTail: "", lines: [], saved: [], warnings };
+  }
+  if (interruptedBy) {
+    return { ok: false, reason: `interrupted by ${interruptedBy}`, stderrTail: turn.stderrTail, lines: [], saved: [], warnings };
   }
   let lastText = turn.state.messages.join("\n");
   try {
@@ -1217,16 +1447,14 @@ async function runImageJobInner(job, { onProgress } = {}) {
   } catch {
     // codex did not write the last-message file
   }
-  fs.rmSync(tmpDir, { recursive: true, force: true });
 
-  const { files: generated, error: attribution } = collectGeneratedImages(home, turn.state.threadId, startMs - 2000);
+  const { files: generated, error: attribution } = collectGeneratedImages(home, turn.state.threadId, startMs);
   if (attribution) {
-    discard();
     return { ok: false, reason: attribution, stderrTail: turn.stderrTail, lines: [], saved: [], warnings };
   }
 
   let finals = [];
-  if (settings.mode === "skill") {
+  if (skill) {
     const results = collectSkillResults({
       outDir: outTarget.dir,
       reserved,
@@ -1235,32 +1463,43 @@ async function runImageJobInner(job, { onProgress } = {}) {
       sinceMs: startMs
     });
     finals = results.map((file) => ({ path: file, source: matchSource(file, generated), inPlace: true }));
-    if (finals.length > 0 && !results.includes(reserved)) {
-      removeIfEmpty(reserved);
+    for (const file of results) {
+      ctx.filled.add(file);
     }
   }
+  const saveErrors = [];
   if (finals.length === 0 && generated.length > 0) {
-    let destinations;
-    if (generated.length === 1) {
-      destinations = [reserved];
-    } else if (outTarget.kind === "file") {
-      removeIfEmpty(reserved);
-      const ext = path.extname(outTarget.path);
-      const stem = (force ? outTarget.path : reserved).slice(0, -ext.length);
-      destinations = generated.map((_, index) => reserveFile(`${stem}-${index + 1}${ext}`, { force }));
-    } else {
-      destinations = generated.map((_, index) => (index === 0 ? reserved : reserveFile(path.join(outTarget.path, `${prefix}${index + 1}.png`), { force })));
-    }
+    const count = generated.length;
+    const ext = path.extname(outTarget.path);
+    const stem = outTarget.path.slice(0, outTarget.path.length - ext.length);
+    const destinationFor = (index) => {
+      // The skill-mode placeholder is reused for the first image when its name fits.
+      if (index === 0 && reserved && (count === 1 || outTarget.kind === "dir")) {
+        return reserved;
+      }
+      if (outTarget.kind === "file") {
+        return reserveFor(ctx, count === 1 ? outTarget.path : `${stem}-${index + 1}${ext}`, force);
+      }
+      return reserveFor(ctx, path.join(outTarget.path, `${prefix}${index + 1}.png`), false);
+    };
     generated.forEach((source, index) => {
-      const written = materialize({ source, destination: destinations[index], size: job.size, force, warnings });
-      finals.push({ path: written, source, inPlace: false });
+      try {
+        const destination = destinationFor(index);
+        const written = materialize({ source, destination, size: job.size, warnings, ctx });
+        ctx.filled.add(written);
+        finals.push({ path: written, source, inPlace: false });
+      } catch (error) {
+        saveErrors.push(error.message);
+        warnings.push(`could not save image ${index + 1} of ${count}: ${error.message}`);
+      }
     });
   }
 
   if (finals.length === 0) {
-    discard();
     let reason;
-    if (turn.timedOut) {
+    if (saveErrors.length > 0) {
+      reason = `could not save the generated image: ${saveErrors[saveErrors.length - 1]}`;
+    } else if (turn.timedOut) {
       reason = `codex timed out after ${Math.round(turn.timeoutMs / 1000)}s`;
     } else if (turn.state.failures.length > 0) {
       reason = `codex failed: ${turn.state.failures[turn.state.failures.length - 1].slice(0, 300)}`;
@@ -1279,13 +1518,16 @@ async function runImageJobInner(job, { onProgress } = {}) {
   const lines = [];
   for (const final of finals) {
     claimedPaths.add(final.path);
-    if (final.inPlace && job.size) {
-      if (sips) {
-        if (!applySize(final.path, job.size)) {
-          warnings.push(`size not applied to ${final.path} (sips failed)`);
+    if (final.inPlace) {
+      fixInPlaceFormat(final.path, warnings, ctx);
+      if (job.size) {
+        if (sips) {
+          if (!applySize(final.path, job.size)) {
+            warnings.push(`size not applied to ${final.path} (sips failed)`);
+          }
+        } else {
+          warnings.push("size not applied (sips not available)");
         }
-      } else {
-        warnings.push("size not applied (sips not available)");
       }
     }
     lines.push(`SAVED: ${final.path}`);
@@ -1499,7 +1741,7 @@ async function handleBatch(argv) {
   const results = new Array(jobs.length).fill(null);
   let next = 0;
   const worker = async () => {
-    while (next < jobs.length) {
+    while (next < jobs.length && !interruptedBy) {
       const index = next;
       next += 1;
       const job = {
@@ -1821,6 +2063,9 @@ function expandArgsStdin(rest) {
 async function main(argv = process.argv.slice(2)) {
   const [command, ...restRaw] = argv;
   const rest = ["generate", "edit", "batch"].includes(command) ? expandArgsStdin(restRaw) : restRaw;
+  if (["generate", "edit", "batch"].includes(command)) {
+    installSignalHandlers();
+  }
 
   if (!command || command === "help" || command === "--help" || command === "-h") {
     console.log(usage());
@@ -1889,6 +2134,7 @@ export {
   expandHome,
   createJsonlStreamer,
   createEventState,
+  detectImageFormat,
   extractPromptAddDirs,
   getCodex,
   hasImageExtension,
